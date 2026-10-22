@@ -1,0 +1,5 @@
+# dsh bundle patch：把本插件声明进 DSH 生态的组合层。
+# insert 一条：id 用于配置树定位，name 是加载器实际 import 的包名（必须等于 package.json 的 name）。
+- insert:
+    - id: dsh-copilot-vision
+      name: dsh-copilot-vision

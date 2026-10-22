@@ -1,0 +1,54 @@
+{
+  "name": "dsh-copilot-vision",
+  "version": "1.0.0",
+  "description": "Computer Use enhancement plugin for DeepSeek Harness (DSH). 纯 JS 视觉差分、网格位置编码、长程任务闭环与人机共驾授权。",
+  "main": "./src/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek",
+    "cordis",
+    "plugin",
+    "computer-use",
+    "screenshot",
+    "gui-automation"
+  ],
+  "author": "ccr-wer",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ccr-wer/dsh-copilot-vision.git"
+  },
+  "homepage": "https://github.com/ccr-wer/dsh-copilot-vision#readme",
+  "bugs": {
+    "url": "https://github.com/ccr-wer/dsh-copilot-vision/issues"
+  },
+  "files": [
+    "src/**/*.js",
+    "cordis.patch.yml",
+    "THIRD_PARTY_NOTICES.md",
+    "THIRD_PARTY_LICENSES/"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "pixelmatch": "^8.0.0",
+    "pngjs": "^7.0.0",
+    "robot-ts": "^2.0.3",
+    "ssh2": "^1.17.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2"
+  }
+}

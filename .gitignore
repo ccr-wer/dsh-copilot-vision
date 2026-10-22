@@ -1,0 +1,21 @@
+# 本地截图与视觉产物（真实全屏截图，含桌面内容）
+.vp-shots/
+
+# 构建产物
+vision-pilot-*.tgz
+
+# 依赖
+node_modules/
+
+# 本机验证脚本（含 C:/Users/imf 等本机绝对路径，不进仓库）
+test-*.mjs
+
+# 环境变量与密钥（绝不入库）
+.env
+.env.*
+!.env.example
+
+# 日志与构建缓存
+*.log
+dist/
+coverage/
