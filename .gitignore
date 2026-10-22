@@ -2,7 +2,9 @@
 .vp-shots/
 
 # 构建产物
+*.tgz
 vision-pilot-*.tgz
+dsh-copilot-vision-*.tgz
 
 # 依赖
 node_modules/
