@@ -118,7 +118,7 @@ export function recordRegions(shotId, regions) {
   entry.regions = regions.map((region) => ({
     bbox: { ...region.bbox },
     localPath: region.localPath,
-    ...(region.gridPath !== undefined ? { gridPath: region.gridPath } : {}),
+    ...(region.gridPath !== undefined ? { gridPath: region.gridPath, gridScale: region.gridScale } : {}),
   }))
   flush()
   return true

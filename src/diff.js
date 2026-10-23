@@ -3,8 +3,8 @@
 //
 // 边界（有意为之，不是欠债）：
 //   - localPath 仍是原尺寸裁剪：局部坐标 + bbox 左上角 = 全局物理坐标，模型可以直接换算。
-//   - 额外产出的 gridPath 是 4x 最近邻放大的「网格放大镜」（见 render.js），
-//     它只用于目测/相对点击，不改变 localPath 的 1:1 语义。
+//   - 额外产出的 gridPath 是按面积自适应倍率的「网格放大镜」（小区域 4x / 中区域 2x / 大区域 1x，见 render.js），
+//     它只用于目测/相对点击，不改变 localPath 的 1:1 语义；倍数随区域以 gridScale 字段返回。
 //   - 不做高频抽帧，只在调用时截一张当前图。
 //   - 尺寸/缩放不一致时直接抛错，不做任何重采样或硬算 —— 显示器或缩放变了，
 //     旧截图的坐标系已经不可信，勉强对齐只会给出错误坐标。
@@ -15,12 +15,12 @@ import pixelmatch from 'pixelmatch'
 import { screenshotAction } from './actions.js'
 import { get, recordRegions } from './shot-index.js'
 import { resolveShotsDir } from './paths.js'
-import { generateGridImage, MAX_GRID_SOURCE_AREA } from './render.js'
+import { generateGridImage, resolveGridScale } from './render.js'
 
 // 小于这个像素数的连通区域按噪声丢弃（光标闪烁、 blinking caret、亚像素抖动）。
 export const DEFAULT_MIN_REGION_AREA = 100
 
-// 网格图的成本是「每个区域一次 4x 放大 + PNG 编码」，差异块很多时（实测出现过单次 105 块）
+// 网格图的成本是「每个区域一次放大 + PNG 编码」，差异块很多时（实测出现过单次 105 块）
 // 全量生成只会拖慢工具并堆满临时目录，所以只给前 N 个（按面积降序）配网格图。
 export const MAX_GRID_REGIONS = 12
 
@@ -148,10 +148,8 @@ export function diffPair({
     }
     if (i >= MAX_GRID_REGIONS) {
       region.gridSkipped = `只给前 ${MAX_GRID_REGIONS} 个区域生成网格图（本区域排第 ${i + 1}）`
-    } else if (bbox.width * bbox.height > MAX_GRID_SOURCE_AREA) {
-      region.gridSkipped =
-        `区域 ${bbox.width}x${bbox.height} 超过网格图上限 ${MAX_GRID_SOURCE_AREA} 物理像素，直接看全屏更合适`
     } else {
+      region.gridScale = resolveGridScale(bbox.width * bbox.height)
       region.gridPath = generateGridImage(currentMeta.path, bbox, currentMeta.scaleFactor, {
         shotId: currentShotId,
         index: i + 1,

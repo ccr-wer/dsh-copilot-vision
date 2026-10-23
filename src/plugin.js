@@ -28,6 +28,16 @@ const AGENT_PROTOCOL =
 const BLIND_CLICK_WARNING =
   '绝对禁止连续两次点击（盲点）。每次点击后，必须立刻调用 vp_wait_change 等待界面响应。'
 
+// 长程上下文纪律：只追加在三个「视觉产出」工具（screenshot/diff/wait）的 description 末尾，
+// 防止模型反复翻历史截图路径把上下文越滚越长。
+const CONTEXT_DISCIPLINE =
+  '【长程上下文纪律】' +
+  '1. 你的物理工作目录中，历史的差分图和网格图会被定期自动清理。' +
+  '请永远只依赖最近一次调用返回的 shotId 和 path。' +
+  '2. 不要去回忆或引用十分钟前的截图路径，如果当前状态偏离预期，请直接重新截图（vp_screenshot），' +
+  '不要试图在历史记录里找答案。' +
+  '3. 历史步骤的文本结论可以留在你的记忆里，但旧图像文件随时可能失效，以最新观察为准。'
+
 const SCREENSHOT_DESCRIPTION =
   '截取主屏全屏并保存为 PNG 文件，返回文件路径（不是 base64，避免占用 token）。' +
   '返回的图像尺寸为物理像素，坐标原点为主屏左上角。' +
@@ -36,7 +46,8 @@ const SCREENSHOT_DESCRIPTION =
   '返回值中的 scaleFactor 用于把图像坐标换算成鼠标注入所需的逻辑坐标；' +
   '调用 vp_click 时直接传图像上的物理像素坐标即可，换算由 vp_click 内部完成。' +
   '返回的 shotId 可用于 vp_screenshot_diff 的 baseline 参数。' +
-  AGENT_PROTOCOL
+  AGENT_PROTOCOL +
+  CONTEXT_DISCIPLINE
 
 const DIFF_DESCRIPTION =
   '把当前屏幕与一张历史截图做逐像素差分，返回连通差异区域及其局部裁剪图。' +
@@ -45,17 +56,20 @@ const DIFF_DESCRIPTION =
   'regions[].bbox 与 regions[].offset 都是物理像素，原点为截图左上角，与 vp_click 的坐标系一致：' +
   '如果在局部图 localPath 上看到目标位于 (lx, ly)，要点击它就传全局坐标 (bbox.x + lx, bbox.y + ly)。' +
   'localPath 是原尺寸裁剪，局部图 1 像素等于全局 1 像素。' +
-  '每个区域还附带 gridPath：该区域 4 倍最近邻放大的网格图，红色网格横向/纵向每一格 = 20 物理像素' +
-  '（放大后 80 像素），网格原点就是 bbox 左上角；配合 vp_click_relative 可直接按相对百分比点击，不必自己算全局坐标。' +
+  '每个区域还附带 gridPath：该区域的最近邻放大网格图，放大倍数按区域面积自适应' +
+  '（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍，倍数见 regions[].gridScale），' +
+  '红色网格横向/纵向每一格 = 20 物理像素，网格原点就是 bbox 左上角；' +
+  '配合 vp_click_relative 可直接按相对百分比点击，不必自己算全局坐标。' +
   '找目标时，优先使用此工具生成局部放大网格图（gridPath）。不要在全屏图上瞎猜坐标，尽量使用 vp_click_relative 汇报百分比。' +
-  '区域超过 250000 物理像素、或排在第 12 个之后时不生成 gridPath，该区域带 gridSkipped 说明原因（bbox 与 localPath 仍可用）。' +
+  '排在第 12 个之后的区域不生成 gridPath，该区域带 gridSkipped 说明原因（bbox 与 localPath 仍可用）。' +
   '小于 100 像素的差异块按噪声（光标、闪烁）丢弃。' +
   'coverage 是差异像素占整屏像素的比例（0~1）；coverage 大于 0.4 时局部图已经没有意义，建议直接看全屏截图。' +
   'changed=false 表示没有超过噪声阈值的差异区域，不等于屏幕完全没变；要确认刚才的操作是否生效，建议看全屏。' +
   'baseline 与当前截图的宽高或 scaleFactor 不一致时直接报错（多半是换了显示器或改了缩放比例），' +
   '不做重采样硬算，请重新调用 vp_screenshot 取新的 baseline。' +
   '每次调用都会真实截一张新屏幕并写入索引，返回的 currentShotId 可以继续当 baseline 用。' +
-  AGENT_PROTOCOL
+  AGENT_PROTOCOL +
+  CONTEXT_DISCIPLINE
 
 const WAIT_DESCRIPTION =
   '等待屏幕相对某张历史截图发生变化：工具内部循环截屏并逐像素比对，一旦变化面积超过阈值就立刻返回，' +
@@ -75,11 +89,12 @@ const WAIT_DESCRIPTION =
   '绝对不要盲目重试，必须先调用 vp_screenshot 获取全局截图、重新规划，再决定下一步（包括是否继续等待）。' +
   '坐标系与 vp_screenshot_diff 完全一致：regions[].bbox 与 offset 都是物理像素、原点为截图左上角，' +
   '局部图 localPath 未放大；在局部图上看到目标位于 (lx, ly)，要点它就传全局坐标 (bbox.x + lx, bbox.y + ly)。' +
-  '每个区域还附带 gridPath：4 倍最近邻放大的网格图，每一格 = 20 物理像素（放大后 80 像素），' +
-  '原点为 bbox 左上角；配合 vp_click_relative 可直接按相对百分比点击。' +
-  '区域超过 250000 物理像素、或排在第 12 个之后时没有 gridPath，会带 gridSkipped 说明。' +
+  '每个区域还附带 gridPath：按面积自适应放大的网格图（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍，' +
+  '倍数见 regions[].gridScale），每一格 = 20 物理像素，原点为 bbox 左上角；配合 vp_click_relative 可直接按相对百分比点击。' +
+  '排在第 12 个之后的区域没有 gridPath，会带 gridSkipped 说明。' +
   '它只负责「等」，不会替你制造变化：需要交互就先 vp_click，再用本工具等界面响应。' +
-  AGENT_PROTOCOL
+  AGENT_PROTOCOL +
+  CONTEXT_DISCIPLINE
 
 const CLICK_DESCRIPTION =
   '在主屏上点击一次鼠标。入参 x/y 为物理像素坐标，原点为主屏左上角，' +
@@ -95,7 +110,7 @@ const CLICK_RELATIVE_DESCRIPTION =
   '在某个差分区域内部按相对位置点击，不需要自己计算全局像素坐标。' +
   'shotId 用 vp_screenshot_diff / vp_wait_change 返回的 currentShotId；index 是 regions 数组里的 1-based 序号。' +
   'xPercent/yPercent 是 0.0~1.0 的相对位置：0 表示区域左/上边缘，1 表示右/下边缘。' +
-  '建议先看该区域的 gridPath：那是 4 倍最近邻放大的网格图，横向/纵向每一小格 = 20 物理像素，' +
+  '建议先看该区域的 gridPath：那是按面积自适应放大的网格图（倍数见 regions[].gridScale），横向/纵向每一小格 = 20 物理像素，' +
   '网格原点为 bbox 左上角；数好格子后，用「格数 × 20 ÷ bbox 宽（或高）」换算成百分比，也可以直接目测。' +
   '换算由本工具完成：physical.x = bbox.x + round(xPercent × (bbox.width - 1))，y 同理；不要自己算。' +
   'index 越界、百分比不在 0~1、shotId 没有差分区域时直接抛错。' +
@@ -374,6 +389,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
                 bbox: BBOX_SCHEMA,
                 localPath: { type: 'string', required: true },
                 gridPath: { type: 'string' },
+                gridScale: { type: 'number' },
                 gridSkipped: { type: 'string' },
                 offset: OFFSET_SCHEMA,
               },
@@ -399,7 +415,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
                 `全局坐标 = (bbox.x + lx, bbox.y + ly) = (${region.bbox.x} + lx, ${region.bbox.y} + ly)；` +
                 `局部图 ${region.localPath}` +
                 (region.gridPath !== undefined
-                  ? `；网格图 ${region.gridPath}（每格 20 物理像素）`
+                  ? `；网格图 ${region.gridPath}（${region.gridScale} 倍放大，每格 20 物理像素）`
                   : `；无网格图：${region.gridSkipped}`),
               ).join('\n')
             : '未发现超过噪声阈值的差异区域；要确认操作是否生效，建议看全屏截图') +
@@ -453,6 +469,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
                 bbox: BBOX_SCHEMA,
                 localPath: { type: 'string', required: true },
                 gridPath: { type: 'string' },
+                gridScale: { type: 'number' },
                 gridSkipped: { type: 'string' },
                 offset: OFFSET_SCHEMA,
               },
@@ -473,12 +490,12 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
               `全局坐标 = (${region.bbox.x} + lx, ${region.bbox.y} + ly)；` +
               `局部图 ${region.localPath}` +
               (region.gridPath !== undefined
-                ? `；网格图 ${region.gridPath}（每格 20 物理像素）`
+                ? `；网格图 ${region.gridPath}（${region.gridScale} 倍放大，每格 20 物理像素）`
                 : `；无网格图：${region.gridSkipped}`),
             ).join('\n') +
             `\n` + JSON.stringify(value) + noticeLine()
           : `等待 ${value.waitedMs}ms 超时：屏幕相对 baseline #${_args.baseline} 没有可见变化，` +
-            `本次未落盘、未消耗 shotId。可以加大 timeoutMs 再等一次，或用 vp_screenshot 看全屏。\n` +
+            `本次未落盘、未消耗 shotId。超时未检测到变化。请先调用 vp_screenshot 重新观察全屏，切勿盲目重试。\n` +
             JSON.stringify(value) + noticeLine(),
       }],
     },

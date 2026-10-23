@@ -1,4 +1,4 @@
-// 位置编码渲染：把差分区域裁出来、4x 最近邻放大、叠加半透明红色网格，
+// 位置编码渲染：把差分区域裁出来、按面积自适应倍率最近邻放大、叠加半透明红色网格，
 // 让模型在「带标尺的放大镜」上数格子，而不是在全屏小图上目测偏移。
 //
 // 选型（不引新依赖）：只用 pngjs + 手写 Bresenham。
@@ -14,11 +14,21 @@ import { resolveShotsDir } from './paths.js'
 
 export const GRID_SCALE = 4
 export const GRID_STEP_PHYSICAL = 20
+// 4x 档的图内步距（放大图上每格像素数）；其余档位 = GRID_STEP_PHYSICAL × 倍数。
 export const GRID_STEP_IMAGE = GRID_SCALE * GRID_STEP_PHYSICAL // 80
 
-// 4x 放大后的缓冲是源面积的 16 倍（RGBA 字节数 64 倍）。250k 物理像素 ≈ 4M 放大像素 ≈ 16MB buffer，
-// 再大就不适合当「局部放大镜」了 —— 退回看全屏截图更合理。
-export const MAX_GRID_SOURCE_AREA = 250_000
+// 自适应倍率阈值（物理像素面积）：小区域 4x 保极限精度，中区域 2x 体积减半，
+// 大区域（整页刷新级）1x 只画网格 —— 1920x1200 全屏若 4x = 7680x4800 ≈ 147MB RGBA，绝不可接受。
+// 1x 后输出不可能超过源截图本身，所以不再需要旧的 250k 物理像素 gridSkipped 上限。
+export const GRID_AREA_MAX_4X = 50_000
+export const GRID_AREA_MAX_2X = 200_000
+
+/** 按区域物理像素面积选放大倍数：<=50000 → 4，<=200000 → 2，否则 1。 */
+export function resolveGridScale(area) {
+  if (area <= GRID_AREA_MAX_4X) return 4
+  if (area <= GRID_AREA_MAX_2X) return 2
+  return 1
+}
 
 const LINE_R = 255
 const LINE_G = 0
@@ -59,7 +69,8 @@ function drawLine(png, x0, y0, x1, y1, alpha = GRID_ALPHA) {
 }
 
 /**
- * 从源截图裁剪 bbox、最近邻放大 GRID_SCALE 倍、每 GRID_STEP_PHYSICAL 物理像素画一条半透明红线，
+ * 从源截图裁剪 bbox、按 resolveGridScale(面积) 自适应倍率最近邻放大、
+ * 每 GRID_STEP_PHYSICAL 物理像素画一条半透明红线，
  * 落盘为 vp-grid-<shotId>-<index>.png。网格原点 = bbox 左上角（bbox 内第 0 个物理像素）。
  *
  * 文件名里的 shotId/index 不在规格签名里，但文件名要求它们，所以通过第 4 个参数传入；
@@ -85,13 +96,7 @@ export function generateGridImage(sourcePngPath, bbox, scaleFactor, { shotId, in
       `收到 shotId=${shotId}, index=${index}`,
     )
   }
-  const area = bbox.width * bbox.height
-  if (area > MAX_GRID_SOURCE_AREA) {
-    throw new Error(
-      `generateGridImage: 区域 ${bbox.width}x${bbox.height}（${area} 像素）超过网格图上限 ` +
-      `${MAX_GRID_SOURCE_AREA}，不放大（放大后缓冲为源面积的 16 倍）`,
-    )
-  }
+  const scale = resolveGridScale(bbox.width * bbox.height)
 
   const source = PNG.sync.read(readFileSync(sourcePngPath))
   if (bbox.x + bbox.width > source.width || bbox.y + bbox.height > source.height) {
@@ -101,28 +106,28 @@ export function generateGridImage(sourcePngPath, bbox, scaleFactor, { shotId, in
     )
   }
 
-  const outWidth = bbox.width * GRID_SCALE
-  const outHeight = bbox.height * GRID_SCALE
+  const outWidth = bbox.width * scale
+  const outHeight = bbox.height * scale
   const out = new PNG({ width: outWidth, height: outHeight })
   const rowBuf = Buffer.alloc(outWidth * 4)
 
   for (let sy = 0; sy < bbox.height; sy++) {
     const srcRow = ((bbox.y + sy) * source.width + bbox.x) * 4
     for (let dx4 = 0; dx4 < outWidth * 4; dx4 += 4) {
-      // dx4/4 = 目标列，再除以 GRID_SCALE 才是源列（最近邻：目标 4 列共用 1 源像素）。
-      const from = srcRow + ((dx4 / (4 * GRID_SCALE)) | 0) * 4
+      // dx4/4 = 目标列，再除以 scale 才是源列（最近邻：目标 scale 列共用 1 源像素）。
+      const from = srcRow + ((dx4 / (4 * scale)) | 0) * 4
       rowBuf[dx4] = source.data[from]
       rowBuf[dx4 + 1] = source.data[from + 1]
       rowBuf[dx4 + 2] = source.data[from + 2]
       rowBuf[dx4 + 3] = source.data[from + 3]
     }
-    for (let k = 0; k < GRID_SCALE; k++) {
-      rowBuf.copy(out.data, (sy * GRID_SCALE + k) * outWidth * 4)
+    for (let k = 0; k < scale; k++) {
+      rowBuf.copy(out.data, (sy * scale + k) * outWidth * 4)
     }
   }
 
-  for (let x = 0; x < outWidth; x += GRID_STEP_IMAGE) drawLine(out, x, 0, x, outHeight - 1)
-  for (let y = 0; y < outHeight; y += GRID_STEP_IMAGE) drawLine(out, 0, y, outWidth - 1, y)
+  for (let x = 0; x < outWidth; x += GRID_STEP_PHYSICAL * scale) drawLine(out, x, 0, x, outHeight - 1)
+  for (let y = 0; y < outHeight; y += GRID_STEP_PHYSICAL * scale) drawLine(out, 0, y, outWidth - 1, y)
 
   const dir = resolveShotsDir()
   mkdirSync(dir, { recursive: true })
