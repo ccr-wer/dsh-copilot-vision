@@ -3,15 +3,28 @@
 // 因此本地可以用 mock 验证注册结构，index.js 则传入真实宿主对象。
 // 本文件不直接 import 宿主包。
 
-import { screenshotAction, clickAction, clickRelativeAction } from './actions.js'
+import { screenshotAction, clickAction, clickRelativeAction, typeAction, keyAction, normalizeThought, describeKeySpec } from './actions.js'
 import { diffAction } from './diff.js'
 import { waitChangeAction } from './wait.js'
-import { getStatus, requestAuth, confirmPending, cancelPending } from './auth.js'
+import { getStatus, requestAuth, requestKeyboardAuth, confirmPending, cancelPending } from './auth.js'
 import { auditLogPath } from './audit.js'
 import { consumeNotice } from './shot-index.js'
 
 export const name = 'dsh-copilot-vision'
 export const inject = ['tools', 'userQuestions']
+
+// 工具选择纪律：Tool Use（专属工具）优先，Computer Use（视觉操作）兜底。
+// 注入到每个工具 description 的开头 —— 决定「用哪个工具」比决定「怎么点」更早发生，
+// 所以它必须排在工作流纪律前面。
+const TOOL_ROUTER =
+  '【工具选择纪律：Tool Use vs Computer Use】' +
+  '你拥有两类工具：A. Tool Use（如文件读写、API 调用等专属工具）；B. Computer Use 视觉操作工具（vp_ 系）。' +
+  '首选 Tool Use：如果任务可以通过 API、读取文件或专用工具完成（如读取 Excel 数据、获取网页源码），' +
+  '绝对不要用视觉截图去点击。直接调用专属工具，它更准、更快。' +
+  'Computer Use 兜底原则：只有当遇到「没有 API 的 GUI 程序」、「必须跨软件协同操作」、「网页上有反爬/验证码」时，' +
+  '才使用 vp_screenshot 等视觉工具。' +
+  '人机分工原则：视觉操作极度依赖屏幕状态。如果你需要输入文字，请先用 vp_click 点中目标输入框，' +
+  '然后再调 vp_type 输入内容，最后用 vp_key 发送 enter 确认。'
 
 // 长程任务工作流（OSA V Loop）：统一追加在所有工具 description 末尾的行为约束。
 // 必须先于各 description 常量定义（const 无提升，顺序错了模块初始化直接 ReferenceError）。
@@ -46,7 +59,14 @@ const COVERAGE_WARNING =
   '如果界面是相同背景色（如白底）的元素位移或扩展，coverage 会非常低，但界面布局可能已经发生巨变。' +
   '判断界面是否发生重要改变，不要只看 coverage，要以返回的 regions 和 gridPath 的实际内容为准。'
 
+// 旁白要求：模型必须用一句自然语言说明自己在干什么，这句话会展示给用户。
+const THOUGHT_REQUIRED =
+  '【必须写旁白】调用本工具时必须通过 thought 参数，用一句自然语言描述你当前正在做什么' +
+  '（例如「我点击了搜索框，准备输入文字」）。这句话会作为进度旁白展示给用户，' +
+  '也是人判断「这个工具到底在干什么」的唯一依据，不许省略、不许写「执行操作」这类空话。'
+
 const SCREENSHOT_DESCRIPTION =
+  TOOL_ROUTER +
   '截取主屏全屏并保存为 PNG 文件，返回文件路径（不是 base64，避免占用 token）。' +
   '返回的图像尺寸为物理像素，坐标原点为主屏左上角。' +
   'MVP 阶段仅支持主屏全屏：不支持区域截图，不支持多显示器选择。' +
@@ -58,6 +78,7 @@ const SCREENSHOT_DESCRIPTION =
   CONTEXT_DISCIPLINE
 
 const DIFF_DESCRIPTION =
+  TOOL_ROUTER +
   '把当前屏幕与一张历史截图做逐像素差分，返回连通差异区域及其局部裁剪图。' +
   'baseline 是 vp_screenshot 返回的 shotId（数字，不是文件路径）；工具会自己截一张当前图再比对，不需要传第二张。' +
   'threshold 是像素色差阈值（0~1，越小越敏感，默认 0.1）。' +
@@ -82,6 +103,7 @@ const DIFF_DESCRIPTION =
   CONTEXT_DISCIPLINE
 
 const WAIT_DESCRIPTION =
+  TOOL_ROUTER +
   '等待屏幕相对某张历史截图发生变化：工具内部循环截屏并逐像素比对，一旦变化面积超过阈值就立刻返回，' +
   '省得你因为「页面还没加载完」而反复调 vp_screenshot_diff 碰运气。' +
   'baseline 是 vp_screenshot 返回的 shotId（数字，不是路径）；timeoutMs 是最长等待毫秒（默认 3000，上限 30000）；' +
@@ -109,16 +131,19 @@ const WAIT_DESCRIPTION =
   CONTEXT_DISCIPLINE
 
 const CLICK_DESCRIPTION =
+  TOOL_ROUTER +
   '在主屏上点击一次鼠标。入参 x/y 为物理像素坐标，原点为主屏左上角，' +
   '与 vp_screenshot 返回图像的坐标系一致。' +
   '内部会除以主屏 scaleFactor 换算成逻辑坐标再注入鼠标，调用方不要自己换算。' +
   '坐标越界会直接抛错，不会静默夹到边界。' +
   '调用前必须已获授权：可用 vp_request_auth 请求人类确认，或由用户按 Shift+Space 进入持续授权。' +
-  'MVP 阶段仅支持单击：不支持拖拽、滚轮、双击和键盘输入。' +
+  'MVP 阶段仅支持单击：不支持拖拽、滚轮、双击；键盘输入请用 vp_type / vp_key。' +
+  THOUGHT_REQUIRED +
   BLIND_CLICK_WARNING +
   AGENT_PROTOCOL
 
 const CLICK_RELATIVE_DESCRIPTION =
+  TOOL_ROUTER +
   '在某个差分区域内部按相对位置点击，不需要自己计算全局像素坐标。' +
   'shotId 用 vp_screenshot_diff / vp_wait_change 返回的 currentShotId；index 是 regions 数组里的 1-based 序号。' +
   'xPercent/yPercent 是 0.0~1.0 的相对位置：0 表示区域左/上边缘，1 表示右/下边缘。' +
@@ -128,10 +153,45 @@ const CLICK_RELATIVE_DESCRIPTION =
   'index 越界、百分比不在 0~1、shotId 没有差分区域时直接抛错。' +
   '只有 vp_screenshot_diff / vp_wait_change 产生的区域可点；普通 vp_screenshot 的 shotId 没有区域。' +
   '调用前同样需要授权：vp_request_auth，或由用户按 Shift+Space 进入持续授权。' +
+  THOUGHT_REQUIRED +
   BLIND_CLICK_WARNING +
   AGENT_PROTOCOL
 
+const TYPE_DESCRIPTION =
+  TOOL_ROUTER +
+  '在当前有光标的焦点框内输入一段文本（输入框、搜索框、编辑区等）。' +
+  '底层直接注入 Unicode 码点，与键盘布局无关，中英文、符号、emoji 都能原样打出来。' +
+  '【绝对不含回车】：本工具只负责把文字打进去，绝不自动发送 Enter。' +
+  '需要提交时另调 vp_key（key=enter），并且在它的 thought 里说明你要提交。' +
+  '【必须先点中输入框】：调用前请确保已经用鼠标点击激活了正确的输入位置，' +
+  '否则文字会打到当前焦点所在的任何控件里。' +
+  '【每次都要人类点头】：键盘操作永远需要一次单独的人类确认，' +
+  '即使当前处于持续授权（persistent）也一样——持续授权只对鼠标点击有效。' +
+  THOUGHT_REQUIRED +
+  AGENT_PROTOCOL
+
+const KEY_DESCRIPTION =
+  TOOL_ROUTER +
+  '发送一次按键或组合键（例如 enter、tab、esc、space、f5、ctrl+c、shift+tab）。' +
+  '键名不区分大小写，支持 ctrl / shift / alt / meta 四种修饰键，用加号连接：ctrl+c。' +
+  '用途是发送控制键：回车提交、Esc 退出、Tab 切换焦点。' +
+  '【高危，请谨慎使用】：Enter 会提交/发送，Ctrl 组合键会复制、粘贴、全选、关闭窗口等，' +
+  '发之前必须先想清楚后果，不要为了「试试看」去按。' +
+  '【必须先点中目标】：本工具只把按键发给当前焦点控件，焦点不对就作用在错的窗口上。' +
+  '【每次都要人类点头】：键盘操作永远需要一次单独的人类确认，' +
+  '即使当前处于持续授权（persistent）也一样——持续授权只对鼠标点击有效。' +
+  '【回车只能由本工具触发】：vp_type 绝不会自动回车；按回车前必须在 thought 里说清意图。' +
+  '【注入通道分两种，返回的 method 会告诉你走的哪条】：' +
+  '不带修饰键的字符键（字母/数字/符号）走 Unicode 直注——因为系统输入法会吞掉扫描码字母键' +
+  '（中文输入法下实测按下不落字，要到下一次 Enter 才吐出幽灵字符），Unicode 直注绕开输入法；' +
+  '控制键（enter/esc/tab/方向键/backspace/delete/f1-f12）、空格、以及任何带 ctrl/alt/meta 的组合键' +
+  '走真实扫描码，组合键语义是真的。' +
+  '【输入法提示】：如果用户正在用输入法打字，组合串还挂在输入法里，本工具按 Enter 会把它一起提交出去。' +
+  THOUGHT_REQUIRED +
+  AGENT_PROTOCOL
+
 const AUTH_REQUEST_DESCRIPTION =
+  TOOL_ROUTER +
   '请求人类授权 Vision-Pilot 执行鼠标点击。这是请求，不是授权本身：' +
   '工具会暂停，并通过宿主的人类问答界面等待用户选择“允许”或“拒绝”。' +
   'mode=once 只放行下一次点击；mode=persistent 放行此后所有点击，直到用户按 Shift+Space 撤销。' +
@@ -141,16 +201,99 @@ const AUTH_REQUEST_DESCRIPTION =
   AGENT_PROTOCOL
 
 const AUTH_STATUS_DESCRIPTION =
+  TOOL_ROUTER +
   '查看 Vision-Pilot 的授权状态（只读，不改变任何权限）。' +
   'state 有五种：unauthorized（未授权）、pending-once（单次授权待人类确认）、' +
   'authorized-once（单次授权已确认、待下一次点击消费）、pending-persistent（持续授权待确认）、' +
   'persistent（持续授权中）。' +
   '持续授权一直有效，直到用户按 Shift+Space 撤销；没有到期时间，也不返回剩余毫秒。' +
+  'keyboardAuthorized 单独表示「是否已获得一次键盘放行」：键盘永远不享受持续授权，' +
+  '每次键入都要单独点头，它为 true 时表示下一次 vp_type / vp_key 已被批准。' +
   '另返回待确认请求 pendingRequest、全局热键（Shift+Space）是否可用 hotkeyAvailable / hotkeyError，' +
   '以及授权审计日志路径 auditLogPath。' +
   AGENT_PROTOCOL
 
 const AUTH_STATES = ['unauthorized', 'pending-once', 'authorized-once', 'pending-persistent', 'persistent']
+
+/** 卡片里展示的文本过长会挤爆 UI，截断即可（原文仍在审计/返回里）。 */
+function truncate(text, limit = 60) {
+  return text.length <= limit ? text : `${text.slice(0, limit)}…`
+}
+
+/**
+ * 弹授权卡片并等人类回答。鼠标授权与键盘授权走同一条通道，只是 mode 不同
+ * （once / persistent / keyboard）。
+ *
+ * 卡片和热键是两个都能改 pendingRequest 的人，谁先落地谁说话：热键一按，
+ * signal 就 abort，这里把它变成一次 reject，和 ask() 赛跑，而不是让答案撞进
+ * confirmPending() 变成「没有待确认的授权请求」。
+ */
+async function askAuthCard(ctx, exec, { mode, question, allowDescription, rejectDescription }) {
+  const request = mode === 'keyboard' ? requestKeyboardAuth() : requestAuth(mode)
+  const cancelled = new Promise((_resolve, reject) => {
+    const abort = () => reject(request.signal.reason)
+    if (request.signal.aborted) abort()
+    else request.signal.addEventListener('abort', abort, { once: true })
+  })
+  // ask() 还没建立就可能同步抛错（宿主没有 userQuestions），那时没人接住这个 reject。
+  cancelled.catch(() => {})
+  let answer
+  try {
+    if (ctx?.userQuestions === undefined) {
+      throw new Error('宿主未提供 userQuestions 服务')
+    }
+    const asking = ctx.userQuestions.ask({
+      questions: [{
+        id: mode === 'keyboard' ? 'vp-keyboard-auth' : 'vp-auth',
+        header: mode === 'keyboard' ? 'Vision-Pilot 键盘授权' : 'Vision-Pilot 授权',
+        question,
+        options: [
+          { label: '允许', description: allowDescription },
+          { label: '拒绝', description: rejectDescription ?? '不改变授权状态' },
+        ],
+      }],
+      ...(exec?.agent !== undefined ? { agent: exec.agent } : {}),
+      ...(exec?.signal !== undefined ? { signal: exec.signal } : {}),
+    })
+    // 本工具返回后那张卡片还在人面前，被关掉时宿主可能 reject；不能让悬空 rejection 冒出去。
+    asking.catch(() => {})
+    answer = await Promise.race([asking, cancelled])
+  } catch (error) {
+    if (error?.code === 'AUTH_CANCELLED') {
+      // 不算失败：请求被更明确的人的动作取代了，把终态如实报回去。
+      return {
+        requestId: request.requestId,
+        state: getStatus().state,
+        confirmed: false,
+        reason: typeof error.reason === 'string' ? error.reason : '本次请求已被取消',
+      }
+    }
+    cancelPending()
+    throw new Error(
+      `授权确认失败：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+
+  const selected = answer?.answers?.[0]?.selected ?? []
+  if (!selected.includes('允许')) {
+    cancelPending()
+    return {
+      requestId: request.requestId,
+      state: getStatus().state,
+      confirmed: false,
+    }
+  }
+
+  const status = confirmPending(request.requestId)
+  return {
+    requestId: request.requestId,
+    state: status.state,
+    confirmed: status.confirmed,
+    ...(status.confirmed
+      ? {}
+      : { reason: '答案到达时这次请求已被热键接管或已取消，按丢弃处理' }),
+  }
+}
 
 /** 索引损坏等只说一次的告知；render 每个结果调用一次，所以用户会看到但它不会刷屏。 */
 function noticeLine() {
@@ -243,12 +386,18 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
         default: 'left',
         description: '鼠标按键，默认 left',
       },
+      thought: {
+        type: 'string',
+        required: true,
+        description: '一句话说明你现在要做什么（例如「我点击了地址栏，准备输入搜索词」），会作为进度旁白展示给用户',
+      },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
+          thought: { type: 'string', required: true },
           clicked: { type: 'boolean', required: true },
           physical: {
             type: 'object',
@@ -274,6 +423,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
       render: (_args, value) => [{
         type: 'text',
         text:
+          `旁白：${value.thought}\n` +
           `点击完成：物理 (${value.physical.x}, ${value.physical.y}) → ` +
           `逻辑 (${value.logical.x}, ${value.logical.y})，按键 ${value.button}\n` +
           JSON.stringify(value),
@@ -314,12 +464,18 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
         default: 'left',
         description: '鼠标按键，默认 left',
       },
+      thought: {
+        type: 'string',
+        required: true,
+        description: '一句话说明你现在要做什么（例如「我点击了搜索结果里的第二条」），会作为进度旁白展示给用户',
+      },
     },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
         properties: {
+          thought: { type: 'string', required: true },
           clicked: { type: 'boolean', required: true },
           shotId: { type: 'number', required: true },
           index: { type: 'number', required: true },
@@ -357,6 +513,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
       render: (_args, value) => [{
         type: 'text',
         text:
+          `旁白：${value.thought}\n` +
           `相对点击完成：shot #${value.shotId} region #${value.index}，` +
           `相对 (${value.relative.xPercent}, ${value.relative.yPercent}) → ` +
           `物理 (${value.physical.x}, ${value.physical.y}) → ` +
@@ -367,6 +524,140 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
     },
     async execute(args) {
       return await clickRelativeAction(args)
+    },
+  })
+
+  const typeTool = defineTool({
+    name: 'vp_type',
+    description: TYPE_DESCRIPTION,
+    parameters: {
+      text: {
+        type: 'string',
+        required: true,
+        description: '要输入的文本（支持中英文/符号/emoji）。本工具绝不自动发送回车。',
+      },
+      thought: {
+        type: 'string',
+        required: true,
+        description: '一句话说明你现在要做什么（例如「我在搜索框里输入 DeepSeek」），会作为进度旁白展示给用户',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          thought: { type: 'string', required: true },
+          typed: { type: 'string', required: true },
+          success: { type: 'boolean', required: true },
+          method: { type: 'string', enum: ['unicode'], required: true },
+          chars: { type: 'number', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text:
+          `旁白：${value.thought}\n` +
+          `输入完成：${value.typed}（${value.chars} 字符，Unicode 直注，未发送回车）\n` +
+          JSON.stringify(value),
+      }],
+    },
+    async execute(args, exec) {
+      const thought = normalizeThought(args.thought, '（模型未提供旁白）')
+      // 参数先验：无效入参不该先弹卡片打扰人。
+      if (typeof args.text !== 'string' || args.text.length === 0) {
+        throw new Error('vp_type: text 必须是非空字符串')
+      }
+      // 键盘永远逐次确认，persistent 也不例外 —— 这张卡是本工具自己发的，不走 vp_request_auth。
+      const card = await askAuthCard(ctx, exec, {
+        mode: 'keyboard',
+        question:
+          `是否允许 Vision-Pilot 执行这一次键盘输入？意图：${thought}｜将输入：${truncate(args.text)}`,
+        allowDescription: '只放行这一次键盘输入',
+        rejectDescription: '不输入任何文字',
+      })
+      if (!card.confirmed) {
+        throw new Error(
+          `vp_type 未获授权：${card.reason ?? '人类拒绝了本次键盘输入'}。键盘操作必须逐次经人类确认。`,
+        )
+      }
+      const result = await typeAction({ text: args.text, thought })
+      return {
+        thought,
+        typed: result.typed,
+        success: true,
+        method: result.method,
+        chars: result.chars,
+      }
+    },
+  })
+
+  const keyTool = defineTool({
+    name: 'vp_key',
+    description: KEY_DESCRIPTION,
+    parameters: {
+      key: {
+        type: 'string',
+        required: true,
+        description: '键名或组合键，例如 enter / esc / tab / space / f5 / ctrl+c / shift+tab',
+      },
+      thought: {
+        type: 'string',
+        required: true,
+        description: '一句话说明你现在要按这个键做什么（例如「我按回车提交搜索」），会作为进度旁白展示给用户',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          thought: { type: 'string', required: true },
+          key: { type: 'string', required: true },
+          keyName: { type: 'string', required: true },
+          modifiers: { type: 'array', required: true, items: { type: 'string' } },
+          method: { type: 'string', enum: ['unicode', 'scancode'], required: true },
+          success: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text:
+          `旁白：${value.thought}\n` +
+          `按键完成：${value.key}` +
+          `${value.modifiers.length > 0 ? `（修饰键：${value.modifiers.join('+')}）` : ''}` +
+          `（通道：${value.method === 'unicode' ? 'Unicode 直注' : '真实扫描码'}）\n` +
+          JSON.stringify(value),
+      }],
+    },
+    async execute(args, exec) {
+      const thought = normalizeThought(args.thought, '（模型未提供旁白）')
+      if (typeof args.key !== 'string' || args.key.trim() === '') {
+        throw new Error('vp_key: key 必须是非空字符串')
+      }
+      // 先解析键名（不碰屏幕、不碰授权）：键名写错就别去打扰人。
+      const spec = describeKeySpec(args.key)
+      const card = await askAuthCard(ctx, exec, {
+        mode: 'keyboard',
+        question:
+          `是否允许 Vision-Pilot 发送这一次按键？意图：${thought}｜将按下：${spec.spec}`,
+        allowDescription: '只放行这一次按键',
+        rejectDescription: '不发送任何按键',
+      })
+      if (!card.confirmed) {
+        throw new Error(
+          `vp_key 未获授权：${card.reason ?? '人类拒绝了本次按键'}。键盘操作必须逐次经人类确认。`,
+        )
+      }
+      const result = await keyAction({ key: args.key, thought })
+      return {
+        thought,
+        key: result.key,
+        keyName: result.keyName,
+        modifiers: result.modifiers,
+        method: result.method,
+        success: true,
+      }
     },
   })
 
@@ -547,78 +838,14 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
       }],
     },
     async execute(args, exec) {
-      const request = requestAuth(args.mode)
-      // 卡片和热键是两个都能改 pendingRequest 的人，谁先落地谁说话：热键一按，
-      // signal 就 abort，这里把它变成一次 reject，和 ask() 赛跑，而不是让答案撞进
-      // confirmPending() 变成「没有待确认的授权请求」。
-      const cancelled = new Promise((_resolve, reject) => {
-        const abort = () => reject(request.signal.reason)
-        if (request.signal.aborted) abort()
-        else request.signal.addEventListener('abort', abort, { once: true })
+      const card = await askAuthCard(ctx, exec, {
+        mode: args.mode,
+        question: args.mode === 'once'
+          ? '是否允许 Vision-Pilot 执行下一次鼠标点击？'
+          : '是否允许 Vision-Pilot 持续执行鼠标点击，直到你按 Shift+Space 撤销？',
+        allowDescription: args.mode === 'once' ? '只放行下一次点击' : '持续放行，直到按 Shift+Space 撤销',
       })
-      // ask() 还没建立就可能同步抛错（宿主没有 userQuestions），那时没人接住这个 reject。
-      cancelled.catch(() => {})
-      let answer
-      try {
-        if (ctx?.userQuestions === undefined) {
-          throw new Error('宿主未提供 userQuestions 服务')
-        }
-        const asking = ctx.userQuestions.ask({
-          questions: [{
-            id: 'vp-auth',
-            header: 'Vision-Pilot 授权',
-            question: args.mode === 'once'
-              ? '是否允许 Vision-Pilot 执行下一次鼠标点击？'
-              : '是否允许 Vision-Pilot 持续执行鼠标点击，直到你按 Shift+Space 撤销？',
-            options: [
-              {
-                label: '允许',
-                description: args.mode === 'once' ? '只放行下一次点击' : '持续放行，直到按 Shift+Space 撤销',
-              },
-              { label: '拒绝', description: '不改变授权状态' },
-            ],
-          }],
-          ...(exec?.agent !== undefined ? { agent: exec.agent } : {}),
-          ...(exec?.signal !== undefined ? { signal: exec.signal } : {}),
-        })
-        // 本工具返回后那张卡片还在人面前，被关掉时宿主可能 reject；不能让悬空 rejection 冒出去。
-        asking.catch(() => {})
-        answer = await Promise.race([asking, cancelled])
-      } catch (error) {
-        if (error?.code === 'AUTH_CANCELLED') {
-          // 不算失败：请求被更明确的人的动作取代了，把终态如实报回去。
-          return {
-            requestId: request.requestId,
-            state: getStatus().state,
-            confirmed: false,
-            reason: typeof error.reason === 'string' ? error.reason : '本次请求已被取消',
-          }
-        }
-        cancelPending()
-        throw new Error(
-          `授权确认失败：${error instanceof Error ? error.message : String(error)}`,
-        )
-      }
-
-      const selected = answer?.answers?.[0]?.selected ?? []
-      if (!selected.includes('允许')) {
-        cancelPending()
-        return {
-          requestId: request.requestId,
-          state: getStatus().state,
-          confirmed: false,
-        }
-      }
-
-      const status = confirmPending(request.requestId)
-      return {
-        requestId: request.requestId,
-        state: status.state,
-        confirmed: status.confirmed,
-        ...(status.confirmed
-          ? {}
-          : { reason: '答案到达时这次请求已被热键接管或已取消，按丢弃处理' }),
-      }
+      return card
     },
   })
 
@@ -632,6 +859,7 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
         additionalProperties: false,
         properties: {
           state: { type: 'string', enum: AUTH_STATES, required: true },
+          keyboardAuthorized: { type: 'boolean', required: true },
           pendingRequest: {
             type: 'object',
             additionalProperties: false,
@@ -665,7 +893,17 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
     },
   })
 
-  const tools = [screenshotTool, diffTool, waitTool, clickTool, clickRelativeTool, requestAuthTool, authStatusTool]
+  const tools = [
+    screenshotTool,
+    diffTool,
+    waitTool,
+    clickTool,
+    clickRelativeTool,
+    typeTool,
+    keyTool,
+    requestAuthTool,
+    authStatusTool,
+  ]
 
   // 不再提供 apply() 方法：注册的唯一生产路径是 index.js 的 apply(ctx)（逐个 register tools），
   // 此前挂在本方法里的启动清理因无人调用而从未触发，清理已随接线修复移入 index.js。

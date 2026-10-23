@@ -15,6 +15,8 @@ export const AUDIT_ACTIONS = [
   'togglePersistent',
   'consumeOnce',
   'clickDenied',
+  'consumeKeyboard',
+  'keyboardDenied',
 ]
 
 export function auditLogPath() {

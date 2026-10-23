@@ -6,7 +6,7 @@
 
 ### 双轨执行
 
-本地轨道经 robot-ts 直连 Windows（屏幕捕获 + 鼠标注入 + 低层键盘钩子）；`src/vp-ssh-core.js` 预留远程轨道接口。当前发版只启用本地轨道，远程不注册任何工具——接口在那里，能力按需放开。
+本地轨道经 robot-ts 直连 Windows（屏幕捕获 + 鼠标注入 + 键盘注入 + 低层键盘钩子）；`src/vp-ssh-core.js` 预留远程轨道接口。当前发版只启用本地轨道，远程不注册任何工具——接口在那里，能力按需放开。
 
 ### 动态视觉感知：不传全屏，传差分
 
@@ -14,7 +14,7 @@
 
 ### 人机共驾安全
 
-授权是一个五态状态机（unauthorized / pending-once / authorized-once / pending-persistent / persistent），铁律：**授权只由人的动作进入和撤销，不由时钟改变**——没有到期时间，没有剩余毫秒，持续授权等再久都不失效（回归测试用 35 秒等待证明这一点）。人有三条通道：问答卡片上点「允许」、Shift+Space 热键随时接管或撤销、JSON Lines 审计日志事后追溯（只记状态机动作与来源，不记任何按键内容）。点击闸门顺序是授权 → 参数 → 越界 → 消费，失败路径不浪费单次授权。
+授权是一个五态状态机（unauthorized / pending-once / authorized-once / pending-persistent / persistent），铁律：**授权只由人的动作进入和撤销，不由时钟改变**——没有到期时间，没有剩余毫秒，持续授权等再久都不失效（回归测试用 35 秒等待证明这一点）。人有三条通道：问答卡片上点「允许」、Shift+Space 热键随时接管或撤销、JSON Lines 审计日志事后追溯（只记状态机动作与来源，不记任何按键内容）。点击闸门顺序是授权 → 参数 → 越界 → 消费，失败路径不浪费单次授权。键盘另走一条独立的一次性通道：**persistent 永不放行键盘**，每一次键入都必须单独点头。
 
 <!-- 配图位 1：授权问答卡片截图（宿主内 vp_request_auth 弹出的人类确认卡片） -->
 
@@ -33,12 +33,43 @@
 | `vp_wait_change` | 高频轮询等待屏幕变化，变化即返回；超时不消耗 shotId。 |
 | `vp_click` | 按绝对物理坐标点击（内部换算逻辑坐标，需已授权）。 |
 | `vp_click_relative` | 在差分区域的网格图内按相对百分比点击（需已授权）。 |
+| `vp_type` | 在当前焦点输入一段文本（Unicode 直注，中英文通吃；**绝不自动回车**）。 |
+| `vp_key` | 发送一次按键或组合键（enter / tab / esc / ctrl+c）；**回车只能由它触发**。 |
 | `vp_request_auth` | 请求人类授权（once / persistent），经宿主问答卡片等待确认。 |
 | `vp_auth_status` | 只读查询授权状态、热键可用性与审计日志路径。 |
 
+## 工具选择纪律（Tool Use vs Computer Use）
+
+这段纪律内嵌在全部 9 个工具的 description 开头——决定「用哪个工具」比决定「怎么点」更早发生：
+
+- **首选 Tool Use**：任务能通过 API、读取文件或专属工具完成（读 Excel、取网页源码），绝对不要用视觉截图去点击——专属工具更准、更快。
+- **Computer Use 兜底**：只有遇到「没有 API 的 GUI 程序」「必须跨软件协同操作」「网页有反爬/验证码」时，才动用 `vp_screenshot` 等视觉工具。
+- **人机分工**：视觉操作极度依赖屏幕状态。需要输入文字时，先 `vp_click` 点中目标输入框，再 `vp_type` 输入内容，最后 `vp_key` 发 `enter` 确认。
+
+## 键盘注入：逐次点头，绝不继承持续授权
+
+键盘能力分两个工具：`vp_type` 负责输入文本，`vp_key` 负责发送按键与组合键。铁律有三条：
+
+1. **键盘永远逐次经人类确认**——即使当前处于持续授权（persistent）也一样。持续授权只对鼠标点击有效；键盘每次都要单独弹卡片、单独点头。授权状态机里键盘走独立的一次性通道（`keyboardAuthorized`），与鼠标的 `persistent` 彻底分开，撤销、取消、重置都会一并清空。
+2. **`vp_type` 绝不自动发送 Enter**——回车只能由 `vp_key` 单独触发，且必须在 `vp_key` 的 `thought` 里说明意图。
+3. **每个动作工具都要写旁白**——`vp_click` / `vp_click_relative` / `vp_type` / `vp_key` 都带必填的 `thought` 参数，用一句自然语言说明当前动作，原样回显在返回 JSON 里，作为给人看的进度旁白。
+
+### 输入法（IME）实测结论
+
+robot-ts 有两条注入通道，本插件按键的性质分流：
+
+| 通道 | 底层 | 适用 |
+|---|---|---|
+| Unicode 直注 | `KEYEVENTF_UNICODE` | 文本字符，绕开键盘布局与输入法 |
+| 真实扫描码 | `KEYEVENTF_SCANCODE` | 控制键与组合键，保留真实按键语义 |
+
+本机中文输入法（WeType）实测会**吞掉扫描码注入的字母键**：按下不落字，要到下一次 Enter 才吐出幽灵字符；还会把引号改写成中文弯引号。因此 `vp_key` 对「无修饰键的字符键（字母/数字/符号）」改走 Unicode 直注——`vp_key "a"` 会立刻落下 `a`，不会留下幽灵文本。控制键（enter / esc / tab / 方向键 / backspace / delete / f1-f12）、空格、以及任何带 ctrl / alt / meta 的组合键走真实扫描码：实测 Ctrl 修饰键确实送达（Ctrl+V 能粘上内容），Shift+End 能选出整段。返回值里的 `method` 字段会告诉你这次走的是哪条通道。
+
+注意：如果用户正在用输入法打字，组合串还挂在输入法里，此时 `vp_key enter` 会把它一起提交出去。
+
 ## 长程任务工作流（The OSA V Loop）
 
-这段协议内嵌在全部 7 个工具的 description 里，模型每次调用都会被提醒：
+这段协议内嵌在全部 9 个工具的 description 里，模型每次调用都会被提醒：
 
 1. **观察 Observe**——每步开始前，用截图或差分确认当前屏幕状态。
 2. **行动 Act**——点击目标（绝对坐标或相对百分比）。
@@ -57,7 +88,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add dsh-copilot-vision
 
 # 或从本地 tarball 安装（开发调试）
 npm pack
-DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.1.0.tgz
+DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.2.0.tgz
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
@@ -68,7 +99,8 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 
 ## 限制与边界
 
-- **输入能力边界**：不支持键盘注入、拖拽、滚轮、双击。模型无法自己「在地址栏输入」，该步需人代做。
+- **输入能力边界**：支持键盘输入（`vp_type` 文本 / `vp_key` 按键与组合键）；不支持拖拽、滚轮、双击。键盘只作用于**当前焦点控件**，模型无法自己「在地址栏输入」前必须先用鼠标点中输入框。
+- **输入法干扰**：中文输入法会吞掉扫描码注入的字母键（按下不落字，要到下一次 Enter 才吐幽灵字符）。插件已对无修饰键的字符键改走 Unicode 直注绕开它，但用户在输入法里挂着的组合串仍会被 `vp_key enter` 一起提交。
 - **聊天窗口自干扰**：宿主聊天窗口的流式重绘会被当成屏幕变化（实测覆盖率约为变化门限的 14 倍）。等页面加载时，先把聊天窗口移出主屏或最小化。
 - **鼠标移动不可检测**：Windows 屏幕捕获不含硬件光标，挪鼠标不产生任何像素变化。
 - **热键无法区分真人与合成按键**：按键事件流不携带注入标记，审计日志只作事后追溯、不作防伪。真正的护栏在插件之外——宿主安全分类器与操作纪律。
@@ -84,6 +116,7 @@ node test-mvp.mjs        # 五态授权 + 热键/卡片竞态 + 无时钟衰减�
 node test-diff.mjs       # 差分与索引（单元层不碰屏幕；--integration 需配合动屏）
 node test-relative.mjs   # 网格渲染 + 相对坐标换算 + 未授权闸门（不截图、不注入）
 node test-wait.mjs       # 轮询语义（--integration 配合静屏/动屏/假基线）
+node test-keyboard.mjs   # 键名解析 + 注入通道分流 + 键盘授权闸门（--live 会真的抢一次键盘焦点）
 ```
 
 ---

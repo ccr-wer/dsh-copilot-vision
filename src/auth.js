@@ -14,6 +14,11 @@
 // 分工：checkCanClick() 只看是否放行、不改变状态；consumeOnce() 才真正消费
 // authorized-once。因此坐标越界等失败路径不会浪费一次单次授权。
 //
+// 键盘另有通道（keyboardGranted）：持续授权对鼠标有效、对键盘永远无效。
+// 键盘每次输入/按键都必须由人单独点头（pendingRequest.mode='keyboard' → 确认后
+// 置 keyboardGranted），消费一次即失效。这是「点击可以享受持续授权的便利，
+// 键盘永远必须人类点头」的实现落点。
+//
 // 每次动作（含被拒绝的点击）都会追加一条审计记录，见 src/audit.js。
 //
 // 竞态约定（P0 修复）：pendingRequest 的生命周期绑一个 AbortController。任何清空 pending 的
@@ -26,27 +31,41 @@ import { logState } from './audit.js'
 const state = {
   persistent: false,
   onceGranted: false,
-  /** @type {{requestId: string, mode: 'once'|'persistent', requestedAt: number, controller: AbortController} | null} */
+  /** 键盘一次性放行：人单独点过头才为真，消费一次即清。持续授权永远不会置它。 */
+  keyboardGranted: false,
+  /** @type {{requestId: string, mode: 'once'|'persistent'|'keyboard', requestedAt: number, controller: AbortController} | null} */
   pendingRequest: null,
   requestSeq: 0,
 }
 
 /** 当前授权状态（只读快照，不含内部的 AbortController）。 */
 export function getStatus() {
+  // 待确认请求独立于 state 展示：persistent 在位时也可能挂着一张卡片（比如键盘确认卡），
+  // 藏起来的话人/model 都看不到「还有一张卡在等」。
+  const pending = state.pendingRequest === null
+    ? {}
+    : {
+      pendingRequest: {
+        requestId: state.pendingRequest.requestId,
+        mode: state.pendingRequest.mode,
+        requestedAt: state.pendingRequest.requestedAt,
+      },
+    }
   if (state.persistent) {
-    return { state: 'persistent' }
+    return { state: 'persistent', keyboardAuthorized: state.keyboardGranted, ...pending }
   }
   if (state.pendingRequest !== null) {
-    const { requestId, mode, requestedAt } = state.pendingRequest
+    // keyboard 也是「一次性授权待确认」，靠 pendingRequest.mode 区分具体是哪一种
     return {
-      state: mode === 'once' ? 'pending-once' : 'pending-persistent',
-      pendingRequest: { requestId, mode, requestedAt },
+      state: state.pendingRequest.mode === 'persistent' ? 'pending-persistent' : 'pending-once',
+      keyboardAuthorized: state.keyboardGranted,
+      ...pending,
     }
   }
   if (state.onceGranted) {
-    return { state: 'authorized-once' }
+    return { state: 'authorized-once', keyboardAuthorized: state.keyboardGranted }
   }
-  return { state: 'unauthorized' }
+  return { state: 'unauthorized', keyboardAuthorized: state.keyboardGranted }
 }
 
 function audit(action, source, previousState, extra) {
@@ -65,14 +84,11 @@ function clearPending(reason) {
 }
 
 /**
- * 模型侧发起授权请求。只登记 pendingRequest，不改变放行状态。
+ * 登记一个待确认请求（三种 mode：once / persistent / keyboard），不改变放行状态。
  * 返回的 signal 会在该请求被热键接管或被取消时 abort，调用方用它把「等人回答」的
  * promise 换成一个可取消的等待。
  */
-export function requestAuth(mode) {
-  if (mode !== 'once' && mode !== 'persistent') {
-    throw new Error(`requestAuth: mode 必须是 once 或 persistent，收到 ${mode}`)
-  }
+function startRequest(mode) {
   const previousState = getStatus().state
   // 连着发两次请求时，前一张卡片不能变成悬空的：它一被答就撞上「已丢弃」，
   // 所以这里同样要 abort 掉，让前一次等待立刻正常返回。
@@ -83,6 +99,24 @@ export function requestAuth(mode) {
   state.pendingRequest = { requestId, mode, requestedAt: Date.now(), controller }
   audit('requestAuth', 'tool', previousState, { requestId, mode })
   return { requestId, signal: controller.signal, status: getStatus() }
+}
+
+/**
+ * 模型侧发起授权请求。只登记 pendingRequest，不改变放行状态。
+ */
+export function requestAuth(mode) {
+  if (mode !== 'once' && mode !== 'persistent') {
+    throw new Error(`requestAuth: mode 必须是 once 或 persistent，收到 ${mode}`)
+  }
+  return startRequest(mode)
+}
+
+/**
+ * 键盘专用的授权请求。与鼠标授权彻底分开：确认后只置 keyboardGranted
+ * （一次性键盘放行），不产生任何鼠标放行；persistent 也永远不会替代它。
+ */
+export function requestKeyboardAuth() {
+  return startRequest('keyboard')
 }
 
 /**
@@ -99,6 +133,9 @@ export function confirmPending(requestId) {
   state.pendingRequest = null
   if (request.mode === 'once') {
     state.onceGranted = true
+  } else if (request.mode === 'keyboard') {
+    // 键盘只拿到「一次键盘放行」；鼠标的授权状态一点没动。
+    state.keyboardGranted = true
   } else {
     state.persistent = true
     state.onceGranted = false
@@ -112,6 +149,7 @@ export function confirmPending(requestId) {
 export function cancelPending() {
   const previousState = getStatus().state
   state.onceGranted = false
+  state.keyboardGranted = false
   clearPending({ code: 'AUTH_CANCELLED', reason: '已取消' })
   audit('cancelPending', 'tool', previousState)
   return getStatus()
@@ -130,10 +168,12 @@ export function togglePersistent(source = 'hotkey') {
   if (state.persistent) {
     state.persistent = false
     state.onceGranted = false
+    state.keyboardGranted = false
     clearPending({ code: 'AUTH_CANCELLED', reason: '热键撤销' })
   } else {
     state.persistent = true
     state.onceGranted = false
+    state.keyboardGranted = false
     clearPending({ code: 'AUTH_CANCELLED', reason: '热键接管' })
   }
   audit('togglePersistent', source, previousState)
@@ -179,10 +219,48 @@ export function checkCanClick() {
   return { allowed: false, reason: '未授权' }
 }
 
+/**
+ * 键盘的放行判断（不消费）。
+ *
+ * 这里是「键盘极度安全闸门」的落点：persistent 不在这里出现。
+ * 持续授权只对鼠标有效；键盘每一次输入/按键都必须有一次独立的、属于它自己的
+ * 人类确认（pendingRequest.mode='keyboard' → 确认后置 keyboardGranted）。
+ * 所以持续授权期间调用键盘工具，永远走「未授权」分支。
+ */
+export function checkCanKeyboard() {
+  if (state.keyboardGranted) {
+    return { allowed: true, reason: '键盘单次授权待使用' }
+  }
+  if (state.pendingRequest !== null && state.pendingRequest.mode === 'keyboard') {
+    return { allowed: false, reason: '键盘授权请求待确认' }
+  }
+  if (state.pendingRequest !== null) {
+    return { allowed: false, reason: '授权请求待确认' }
+  }
+  return { allowed: false, reason: '未授权（键盘操作必须逐次经人类确认，持续授权也不例外）' }
+}
+
+/**
+ * 消费一次键盘放行：keyboardGranted 置位时消费并清空。
+ * 一次性：消费完就不再放行下一次键盘操作。
+ */
+export function consumeKeyboard(extra = {}) {
+  const previousState = getStatus().state
+  if (state.keyboardGranted) {
+    state.keyboardGranted = false
+    audit('consumeKeyboard', 'tool', previousState, { allowed: true, mode: 'keyboard', ...extra })
+    return { allowed: true, mode: 'keyboard' }
+  }
+  const reason = state.pendingRequest !== null ? '授权请求待确认' : '未授权'
+  audit('consumeKeyboard', 'tool', previousState, { allowed: false, reason, ...extra })
+  return { allowed: false, reason }
+}
+
 /** 测试专用：重置为未授权。 */
 export function _resetForTests() {
   state.persistent = false
   state.onceGranted = false
+  state.keyboardGranted = false
   clearPending({ code: 'AUTH_CANCELLED', reason: '测试重置' })
   state.requestSeq = 0
 }
@@ -195,6 +273,7 @@ export function _peekForTests() {
   return {
     persistent: state.persistent,
     onceGranted: state.onceGranted,
+    keyboardGranted: state.keyboardGranted,
     hasPending: state.pendingRequest !== null,
   }
 }
