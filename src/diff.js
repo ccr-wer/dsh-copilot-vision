@@ -3,7 +3,8 @@
 //
 // 边界（有意为之，不是欠债）：
 //   - localPath 仍是原尺寸裁剪：局部坐标 + bbox 左上角 = 全局物理坐标，模型可以直接换算。
-//   - 额外产出的 gridPath 是按面积自适应倍率的「网格放大镜」（小区域 4x / 中区域 2x / 大区域 1x，见 render.js），
+//   - 额外产出的 gridPath 是按面积与单边长度自适应倍率的「网格放大镜」（小区域 4x / 中区域 2x / 大区域 1x，
+//     放大后单边不超过 2000 像素，见 render.js），
 //     它只用于目测/相对点击，不改变 localPath 的 1:1 语义；倍数随区域以 gridScale 字段返回。
 //   - 不做高频抽帧，只在调用时截一张当前图。
 //   - 尺寸/缩放不一致时直接抛错，不做任何重采样或硬算 —— 显示器或缩放变了，
@@ -149,7 +150,7 @@ export function diffPair({
     if (i >= MAX_GRID_REGIONS) {
       region.gridSkipped = `只给前 ${MAX_GRID_REGIONS} 个区域生成网格图（本区域排第 ${i + 1}）`
     } else {
-      region.gridScale = resolveGridScale(bbox.width * bbox.height)
+      region.gridScale = resolveGridScale(bbox.width, bbox.height)
       region.gridPath = generateGridImage(currentMeta.path, bbox, currentMeta.scaleFactor, {
         shotId: currentShotId,
         index: i + 1,

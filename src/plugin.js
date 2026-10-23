@@ -21,6 +21,8 @@ const AGENT_PROTOCOL =
   '2. 行动（Act）：点击目标（绝对坐标或相对坐标）。' +
   '3. 等待（Wait）：点击后必须立刻调用 vp_wait_change，确认界面给出了反馈。' +
   '4. 验证（Verify）：结合 wait_change 的返回结果（变化区域、超时），判断是否达到了本步目标；' +
+  '注意 coverage 低不代表界面没变——相同底色的元素位移或扩展可能覆盖率极低但布局已巨变，' +
+  '判断要以 regions 与 gridPath 的实际内容为准；' +
   '若超时未变，重新截图全局（Observe）再规划。' +
   '你的“工作日志”就是你自己每一次工具调用的原始 JSON 返回，请在每次决策前仔细阅读上一步的返回。'
 
@@ -37,6 +39,12 @@ const CONTEXT_DISCIPLINE =
   '2. 不要去回忆或引用十分钟前的截图路径，如果当前状态偏离预期，请直接重新截图（vp_screenshot），' +
   '不要试图在历史记录里找答案。' +
   '3. 历史步骤的文本结论可以留在你的记忆里，但旧图像文件随时可能失效，以最新观察为准。'
+
+// coverage 误导：白底同类元素位移/扩展时，覆盖率可能只有百分之几，但布局已经巨变。
+const COVERAGE_WARNING =
+  '【重要：关于 coverage】coverage 只是变色像素的面积比例。' +
+  '如果界面是相同背景色（如白底）的元素位移或扩展，coverage 会非常低，但界面布局可能已经发生巨变。' +
+  '判断界面是否发生重要改变，不要只看 coverage，要以返回的 regions 和 gridPath 的实际内容为准。'
 
 const SCREENSHOT_DESCRIPTION =
   '截取主屏全屏并保存为 PNG 文件，返回文件路径（不是 base64，避免占用 token）。' +
@@ -57,13 +65,15 @@ const DIFF_DESCRIPTION =
   '如果在局部图 localPath 上看到目标位于 (lx, ly)，要点击它就传全局坐标 (bbox.x + lx, bbox.y + ly)。' +
   'localPath 是原尺寸裁剪，局部图 1 像素等于全局 1 像素。' +
   '每个区域还附带 gridPath：该区域的最近邻放大网格图，放大倍数按区域面积自适应' +
-  '（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍，倍数见 regions[].gridScale），' +
+  '（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍），且放大后任何单边不超过 2000 像素' +
+  '（长边 >500 不做 4 倍、>1000 不做 2 倍），实际倍数见 regions[].gridScale；' +
   '红色网格横向/纵向每一格 = 20 物理像素，网格原点就是 bbox 左上角；' +
   '配合 vp_click_relative 可直接按相对百分比点击，不必自己算全局坐标。' +
   '找目标时，优先使用此工具生成局部放大网格图（gridPath）。不要在全屏图上瞎猜坐标，尽量使用 vp_click_relative 汇报百分比。' +
   '排在第 12 个之后的区域不生成 gridPath，该区域带 gridSkipped 说明原因（bbox 与 localPath 仍可用）。' +
   '小于 100 像素的差异块按噪声（光标、闪烁）丢弃。' +
   'coverage 是差异像素占整屏像素的比例（0~1）；coverage 大于 0.4 时局部图已经没有意义，建议直接看全屏截图。' +
+  COVERAGE_WARNING +
   'changed=false 表示没有超过噪声阈值的差异区域，不等于屏幕完全没变；要确认刚才的操作是否生效，建议看全屏。' +
   'baseline 与当前截图的宽高或 scaleFactor 不一致时直接报错（多半是换了显示器或改了缩放比例），' +
   '不做重采样硬算，请重新调用 vp_screenshot 取新的 baseline。' +
@@ -84,13 +94,15 @@ const WAIT_DESCRIPTION =
   '变化判据：过滤噪声（抗锯齿像素、以及小于 100 像素的连通块）后，差异像素占整屏比例 > 0.001 才算变了。' +
   '检测到变化返回 {changed:true, waitedMs, currentShotId, regions, coverage}，' +
   '其中 currentShotId 是那张正式截图，可以继续当后续 baseline 用。' +
+  COVERAGE_WARNING +
   '超时未变返回 {changed:false, waitedMs, timeout:true}，没有 currentShotId 也没有 regions；' +
   '说明这段时间屏幕真的没动。如果返回 timeout: true，代表操作可能失败或界面卡死：' +
   '绝对不要盲目重试，必须先调用 vp_screenshot 获取全局截图、重新规划，再决定下一步（包括是否继续等待）。' +
   '坐标系与 vp_screenshot_diff 完全一致：regions[].bbox 与 offset 都是物理像素、原点为截图左上角，' +
   '局部图 localPath 未放大；在局部图上看到目标位于 (lx, ly)，要点它就传全局坐标 (bbox.x + lx, bbox.y + ly)。' +
-  '每个区域还附带 gridPath：按面积自适应放大的网格图（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍，' +
-  '倍数见 regions[].gridScale），每一格 = 20 物理像素，原点为 bbox 左上角；配合 vp_click_relative 可直接按相对百分比点击。' +
+  '每个区域还附带 gridPath：按面积自适应放大的网格图（≤50000 物理像素 4 倍、≤200000 2 倍、更大 1 倍；' +
+  '放大后任何单边不超过 2000 像素，长边 >500 不做 4 倍、>1000 不做 2 倍，实际倍数见 regions[].gridScale），' +
+  '每一格 = 20 物理像素，原点为 bbox 左上角；配合 vp_click_relative 可直接按相对百分比点击。' +
   '排在第 12 个之后的区域没有 gridPath，会带 gridSkipped 说明。' +
   '它只负责「等」，不会替你制造变化：需要交互就先 vp_click，再用本工具等界面响应。' +
   AGENT_PROTOCOL +

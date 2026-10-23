@@ -23,11 +23,19 @@ export const GRID_STEP_IMAGE = GRID_SCALE * GRID_STEP_PHYSICAL // 80
 export const GRID_AREA_MAX_4X = 50_000
 export const GRID_AREA_MAX_2X = 200_000
 
-/** 按区域物理像素面积选放大倍数：<=50000 → 4，<=200000 → 2，否则 1。 */
-export function resolveGridScale(area) {
-  if (area <= GRID_AREA_MAX_4X) return 4
-  if (area <= GRID_AREA_MAX_2X) return 2
-  return 1
+// 面积小但极细长的区域（4344x4 的边框/分隔线）会骗过面积档位：4x 后变成 17376x16 的超长图。
+// 因此再按单边长度封顶：放大后任何一边都不得超过 2000 像素（即 4x 要求长边 <=500，2x 要求 <=1000）。
+// 1x 不再放大，允许输出等于源区域本身，即使源区域长边超过 2000（裁剪尺寸不能凭空压缩）。
+export const GRID_MAX_OUTPUT_EDGE = 2000
+
+/** 按区域物理像素尺寸选放大倍数：面积定基础档位，单边上限再降档。 */
+export function resolveGridScale(width, height) {
+  const area = width * height
+  const maxEdge = Math.max(width, height)
+  let scale = area <= GRID_AREA_MAX_4X ? 4 : area <= GRID_AREA_MAX_2X ? 2 : 1
+  if (scale === 4 && maxEdge * 4 > GRID_MAX_OUTPUT_EDGE) scale = 2
+  if (scale === 2 && maxEdge * 2 > GRID_MAX_OUTPUT_EDGE) scale = 1
+  return scale
 }
 
 const LINE_R = 255
@@ -69,7 +77,7 @@ function drawLine(png, x0, y0, x1, y1, alpha = GRID_ALPHA) {
 }
 
 /**
- * 从源截图裁剪 bbox、按 resolveGridScale(面积) 自适应倍率最近邻放大、
+ * 从源截图裁剪 bbox、按 resolveGridScale(宽, 高) 自适应倍率最近邻放大、
  * 每 GRID_STEP_PHYSICAL 物理像素画一条半透明红线，
  * 落盘为 vp-grid-<shotId>-<index>.png。网格原点 = bbox 左上角（bbox 内第 0 个物理像素）。
  *
@@ -96,7 +104,7 @@ export function generateGridImage(sourcePngPath, bbox, scaleFactor, { shotId, in
       `收到 shotId=${shotId}, index=${index}`,
     )
   }
-  const scale = resolveGridScale(bbox.width * bbox.height)
+  const scale = resolveGridScale(bbox.width, bbox.height)
 
   const source = PNG.sync.read(readFileSync(sourcePngPath))
   if (bbox.x + bbox.width > source.width || bbox.y + bbox.height > source.height) {
