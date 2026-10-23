@@ -1,6 +1,6 @@
 {
   "name": "dsh-copilot-vision",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Computer Use enhancement plugin for DeepSeek Harness (DSH). 纯 JS 视觉差分、网格位置编码、长程任务闭环与人机共驾授权。",
   "main": "./src/index.js",
   "scripts": {

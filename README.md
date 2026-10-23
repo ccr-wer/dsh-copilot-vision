@@ -57,7 +57,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add dsh-copilot-vision
 
 # 或从本地 tarball 安装（开发调试）
 npm pack
-DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.0.0.tgz
+DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.1.0.tgz
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
