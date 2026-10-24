@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { physicalToLogical, relativeToPhysical } from './coords.js'
 import { parseKeySpec, resolveUnicodeChar } from './keys.js'
 import { loadRobotTs } from './robot-ts.js'
-import { checkCanClick, checkCanKeyboard, consumeKeyboard, consumeOnce, getStatus } from './auth.js'
+import { checkCanClick, getStatus } from './auth.js'
 import { logState } from './audit.js'
 import { resolveShotsDir } from './paths.js'
 import { get, nextShotId, record } from './shot-index.js'
@@ -66,25 +66,34 @@ export function normalizeThought(thought, fallback) {
   return fallback
 }
 
-/** 按物理像素坐标点击一次。x/y 来自 vp_screenshot 的图像坐标系；授权闸门先于坐标校验。 */
+const AUTH_HINT =
+  "请提示用户按 Shift+Space 开启持续授权，或调用 vp_request_auth(mode='persistent') 申请授权。"
+
+/** 四种注入共用的拒绝路径：先落审计，再抛一句模型能照着做的错误。 */
+function denyInjection(tool, gate, extra = {}) {
+  const state = getStatus().state
+  logState('actionDenied', 'tool', state, state, { tool, reason: gate.reason, ...extra })
+  throw new Error(gate.reason === '未授权' ? `未获授权。${AUTH_HINT}` : `${gate.reason}。${AUTH_HINT}`)
+}
+
+/** 放行注入后记一笔；不改变授权状态，只留「这一次真的注入了」的证据。 */
+function allowInjection(tool, extra = {}) {
+  const state = getStatus().state
+  logState('actionAllowed', 'tool', state, state, { tool, ...extra })
+}
+
+/**
+ * 按物理像素坐标点击一次。x/y 来自 vp_screenshot 的图像坐标系；授权闸门先于坐标校验。
+ * 授权只认 persistent：unauthorized 直接抛错，不弹卡片、不消费任何东西。
+ */
 export async function clickAction(args = {}) {
   const { x, y } = args
   const gate = checkCanClick()
   if (!gate.allowed) {
     // 闸门在坐标校验之前，所以这里的 x/y 还没验过；只在确认是数值时才写进审计，
-    // 避免把任意入参当成坐标记录。logical 此刻拿不到 scaleFactor（不为此新建会话），故省略。
-    const state = getStatus().state
-    logState('clickDenied', 'tool', state, state, {
-      reason: gate.reason,
-      ...(Number.isFinite(x) && Number.isFinite(y) ? { physical: { x, y } } : {}),
-    })
-    throw new Error(`vp_click 未获授权：${gate.reason}。可调用 vp_request_auth 请求，或按 Shift+Space 进入持续授权。`)
-  }
-  const { Session, MouseButton } = loadRobotTs()
-  const buttons = {
-    left: MouseButton.Left,
-    right: MouseButton.Right,
-    middle: MouseButton.Middle,
+    // 避免把任意入参当成坐标记录。
+    denyInjection('vp_click', gate,
+      Number.isFinite(x) && Number.isFinite(y) ? { physical: { x, y } } : {})
   }
   const { button = 'left' } = args
 
@@ -93,6 +102,18 @@ export async function clickAction(args = {}) {
   }
   if (x < 0 || y < 0) {
     throw new Error(`vp_click: 坐标不能为负数，收到 x=${x}, y=${y}`)
+  }
+
+  return await injectClick({ x, y, button, thought: args.thought, tool: 'vp_click' })
+}
+
+/** 真实注入的共用实现：参数校验、越界检查、换算逻辑坐标、移动并点击。 */
+async function injectClick({ x, y, button = 'left', thought, tool }) {
+  const { Session, MouseButton } = loadRobotTs()
+  const buttons = {
+    left: MouseButton.Left,
+    right: MouseButton.Right,
+    middle: MouseButton.Middle,
   }
   if (!Object.hasOwn(buttons, button)) {
     throw new Error(`vp_click: button 必须是 left|right|middle，收到 ${button}`)
@@ -114,16 +135,12 @@ export async function clickAction(args = {}) {
     }
 
     const logical = physicalToLogical({ x, y }, primary.scaleFactor)
-    // 参数与越界都通过后才消费放行，避免一次失败的调用浪费单次授权。
-    const consumed = consumeOnce()
-    if (!consumed.allowed) {
-      throw new Error(`vp_click 未获授权：${consumed.reason}。可调用 vp_request_auth 请求，或按 Shift+Space 进入持续授权。`)
-    }
     await session.mouse.move(logical)
     await session.mouse.click(buttons[button])
+    allowInjection(tool, { physical: { x, y }, button })
 
     return {
-      thought: normalizeThought(args.thought, `点击屏幕物理坐标 (${x}, ${y})`),
+      thought: normalizeThought(thought, `点击屏幕物理坐标 (${x}, ${y})`),
       clicked: true,
       physical: { x, y },
       logical,
@@ -137,18 +154,13 @@ export async function clickAction(args = {}) {
 /**
  * 在当前焦点位置输入文本。绝对不包含回车：回车只能由 vp_key 单独触发。
  *
- * 授权闸门与鼠标点击彻底分开：persistent 也不放行键盘，必须有一次针对本次输入的
- * 人类确认（keyboardGranted），消费一次即失效。闸门顺序：授权 → 参数 → 消费，
- * 所以无效入参不会浪费那张一次性授权。
+ * 授权与鼠标完全一致：persistent 直接放行，unauthorized 直接拦截。
+ * V1.3 取消了键盘独立通道——单次确认卡片会把焦点抢回 DSH，注入反而落错窗口。
  */
 export async function typeAction(args = {}) {
-  const gate = checkCanKeyboard()
+  const gate = checkCanClick()
   if (!gate.allowed) {
-    const state = getStatus().state
-    logState('keyboardDenied', 'tool', state, state, { reason: gate.reason, tool: 'vp_type' })
-    throw new Error(
-      `vp_type 未获授权：${gate.reason}。键盘操作必须逐次经人类确认，持续授权也不例外。`,
-    )
+    denyInjection('vp_type', gate)
   }
 
   const { text } = args
@@ -165,15 +177,10 @@ export async function typeAction(args = {}) {
     if (!session.capabilities.canTypeUnicode) {
       throw new Error('当前宿主环境不支持 Unicode 文本注入（canTypeUnicode=false）')
     }
-    const consumed = consumeKeyboard({ tool: 'vp_type', chars: text.length })
-    if (!consumed.allowed) {
-      throw new Error(
-        `vp_type 未获授权：${consumed.reason}。键盘操作必须逐次经人类确认，持续授权也不例外。`,
-      )
-    }
     // robot-ts 的 typeText 走 KEYEVENTF_UNICODE 直接注入码点，与键盘布局无关，
     // 中文/emoji 都能原样打出来，不需要剪贴板中转。
     await session.keyboard.typeText(text)
+    allowInjection('vp_type', { chars: text.length })
     return {
       typed: text,
       method: 'unicode',
@@ -186,7 +193,7 @@ export async function typeAction(args = {}) {
 
 /**
  * 只解析按键写法，不碰屏幕、不碰授权。
- * 供工具层在弹卡片之前先验一遍：无效键名不该先打扰人再报错。
+ * 供宿主层在真正注入前提前报错，键名写错不该走到会话创建。
  */
 export function describeKeySpec(key) {
   const { Key, Modifier } = loadRobotTs()
@@ -199,7 +206,7 @@ export function describeKeySpec(key) {
 
 /**
  * 发送一次按键或组合键（如 enter / tab / esc / ctrl+c）。
- * 授权闸门与 vp_type 完全相同：persistent 永不直接放行键盘。
+ * 授权闸门与 vp_type 完全相同：persistent 直接放行，unauthorized 直接拦截。
  *
  * 注入通道按键的性质分流（本机实测）：
  *   - 无修饰键的字符键（字母/数字/符号）→ Unicode 直注。扫描码通道会经过系统输入法，
@@ -208,13 +215,9 @@ export function describeKeySpec(key) {
  *     这样组合键语义是真的（Ctrl+V 实测能粘上），space 也能激活聚焦的按钮。
  */
 export async function keyAction(args = {}) {
-  const gate = checkCanKeyboard()
+  const gate = checkCanClick()
   if (!gate.allowed) {
-    const state = getStatus().state
-    logState('keyboardDenied', 'tool', state, state, { reason: gate.reason, tool: 'vp_key' })
-    throw new Error(
-      `vp_key 未获授权：${gate.reason}。键盘操作必须逐次经人类确认，持续授权也不例外。`,
-    )
+    denyInjection('vp_key', gate)
   }
 
   const { key } = args
@@ -233,17 +236,12 @@ export async function keyAction(args = {}) {
     if (unicodeChar !== null && !session.capabilities.canTypeUnicode) {
       throw new Error('当前宿主环境不支持 Unicode 文本注入（canTypeUnicode=false）')
     }
-    const consumed = consumeKeyboard({ tool: 'vp_key', key: spec.spec })
-    if (!consumed.allowed) {
-      throw new Error(
-        `vp_key 未获授权：${consumed.reason}。键盘操作必须逐次经人类确认，持续授权也不例外。`,
-      )
-    }
     if (unicodeChar !== null) {
       await session.keyboard.typeChar(unicodeChar.codePointAt(0))
     } else {
       await session.keyboard.tap(spec.code, spec.modifiers)
     }
+    allowInjection('vp_key', { key: spec.spec })
     return {
       key: spec.spec,
       keyName: spec.keyName,
@@ -286,22 +284,24 @@ export function resolveRelativeTarget({ shotId, index, xPercent, yPercent }) {
 }
 
 /**
- * 在差分区域内部按相对位置点击。授权闸门与 vp_click 保持同一顺序：
- * 授权 → 参数合法性 → 越界 → 消费，所以未授权时不会读索引、不会新建 robot-ts 会话。
+ * 在差分区域内部按相对位置点击。授权闸门与 vp_click 同一顺序：
+ * 授权 → 参数合法性 → 越界 → 注入，所以未授权时不会读索引、不会新建 robot-ts 会话。
  */
 export async function clickRelativeAction(args = {}) {
   const gate = checkCanClick()
   if (!gate.allowed) {
-    const state = getStatus().state
-    logState('clickDenied', 'tool', state, state, { reason: gate.reason, tool: 'vp_click_relative' })
-    throw new Error(
-      `vp_click_relative 未获授权：${gate.reason}。可调用 vp_request_auth 请求，或按 Shift+Space 进入持续授权。`,
-    )
+    denyInjection('vp_click_relative', gate)
   }
 
   const { shotId, index, xPercent, yPercent, button = 'left' } = args
   const { bbox, physical } = resolveRelativeTarget({ shotId, index, xPercent, yPercent })
-  const clicked = await clickAction({ x: physical.x, y: physical.y, button, thought: args.thought })
+  const clicked = await injectClick({
+    x: physical.x,
+    y: physical.y,
+    button,
+    thought: args.thought,
+    tool: 'vp_click_relative',
+  })
   return {
     thought: clicked.thought,
     clicked: true,

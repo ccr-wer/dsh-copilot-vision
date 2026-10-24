@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import { PNG } from 'pngjs'
 import pixelmatch from 'pixelmatch'
 import { screenshotAction } from './actions.js'
-import { get, recordRegions } from './shot-index.js'
+import { get, recordRegions, assertShotFileExists } from './shot-index.js'
 import { resolveShotsDir } from './paths.js'
 import { generateGridImage, resolveGridScale } from './render.js'
 
@@ -186,6 +186,7 @@ export async function diffAction({
       `vp_screenshot_diff: baseline shotId ${baseline} 不存在，可先用 vp_screenshot 截一张`,
     )
   }
+  assertShotFileExists(baseline, baselineMeta, 'vp_screenshot_diff')
   const current = await screenshotAction()
   return diffPair({
     baselineMeta,

@@ -8,15 +8,14 @@ import { join } from 'node:path'
 import { resolveShotsDir } from './paths.js'
 
 // 状态机会记录的动作集合（回归测试据此校验，不要在这里放实现分支）。
+// actionAllowed / actionDenied 不改变授权状态，只记录某次注入被放行或被闸门拦截。
 export const AUDIT_ACTIONS = [
   'requestAuth',
   'confirmPending',
   'cancelPending',
   'togglePersistent',
-  'consumeOnce',
-  'clickDenied',
-  'consumeKeyboard',
-  'keyboardDenied',
+  'actionAllowed',
+  'actionDenied',
 ]
 
 export function auditLogPath() {

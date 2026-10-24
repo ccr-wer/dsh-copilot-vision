@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs'
 import { PNG } from 'pngjs'
 import pixelmatch from 'pixelmatch'
 import { loadRobotTs } from './robot-ts.js'
-import { get } from './shot-index.js'
+import { get, assertShotFileExists } from './shot-index.js'
 import { screenshotAction } from './actions.js'
 import { diffPair, connectedComponents, DEFAULT_MIN_REGION_AREA } from './diff.js'
 
@@ -72,6 +72,7 @@ export async function waitChangeAction({
       `vp_wait_change: baseline shotId ${baseline} 不存在，可先用 vp_screenshot 截一张`,
     )
   }
+  assertShotFileExists(baseline, baselineMeta, 'vp_wait_change')
   const baselineImg = readPng(baselineMeta.path)
 
   const { Session } = loadRobotTs()

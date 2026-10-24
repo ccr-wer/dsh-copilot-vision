@@ -5,7 +5,7 @@
 // 落盘策略是有意的：JSON 不是行式格式，无法像审计日志那样 append，
 // 所以每次 record 都用 writeFileSync 全量覆盖。MVP 假定单进程、工具调用串行，
 // 因此不做并发保护（两个进程同时写会互相覆盖，属于已知取舍，不是隐藏 bug）。
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveShotsDir } from './paths.js'
 
@@ -105,6 +105,31 @@ export function record(shotId, meta) {
 export function get(shotId) {
   if (!Number.isFinite(shotId)) return undefined
   return load()[String(shotId)]
+}
+
+/**
+ * vp_summarize 把保留的截图移进 archives/ 后，同步改索引里的路径，
+ * 否则「关键截图」虽然还在盘上，差分却会读不到。
+ */
+export function relocate(shotId, newPath) {
+  const entry = get(shotId)
+  if (entry === undefined) return false
+  entry.path = newPath
+  flush()
+  return true
+}
+
+/**
+ * 索引条目还在、文件却被 vp_summarize 清掉时，给出确定的错误而不是裸 ENOENT。
+ * 条目本身刻意不删：nextShotId 靠索引最大键播种，删条目会让宿主重启后复用旧 shotId，
+ * 静默指向一张新截图 —— 那比「文件不存在」危险得多。
+ */
+export function assertShotFileExists(shotId, meta, toolName) {
+  if (!existsSync(meta.path)) {
+    throw new Error(
+      `${toolName}: shotId ${shotId} 的截图文件已不存在（可能已被 vp_summarize 清理），请重新截图`,
+    )
+  }
 }
 
 /**

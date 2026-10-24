@@ -12,9 +12,16 @@
 
 `vp_screenshot_diff` 用 pixelmatch 逐像素比对，4 邻域连通块合并，小于 100 像素的噪声（光标、闪烁）直接丢弃，把「哪里变了」而不是「整屏是什么」交还给模型。`vp_wait_change` 更进一步：每 100ms 在内存里截屏比对，**轮询期零落盘**，变化出现的瞬间才落一张正式截图。「等页面加载」从反复截图碰运气，变成一次有明确语义的等待。换显示器或改缩放后坐标即不可信——宽高或 scaleFactor 不一致直接报错，绝不重采样硬算。网格放大图不再固定 4 倍：按区域面积自适应倍率——≤50,000 物理像素 4x、≤200,000 2x、更大 1x 只画网格，大区域不再产出巨图；同时以「放大后单边 ≤2,000 像素」兜底，4,344×4 这类细长条不会被放大成 17,376 宽的畸形长图。每个区域以 `gridScale` 字段标明实际倍数。`coverage` 只是变色像素的比例，白底同类元素位移时可能仅 2% 却已改天换地——判断变化要看 `regions` 与 `gridPath` 的实际内容，不能只看覆盖率。上下文策略同样内置在工具 description 里（「长程上下文纪律」）：旧图会被清理、历史路径随时可能失效，模型必须以最新一次观察为准，偏离预期就直接重新截图，不翻历史记录。
 
-### 人机共驾安全
+### 人机共驾安全：持续授权 + 物理热键急停
 
-授权是一个五态状态机（unauthorized / pending-once / authorized-once / pending-persistent / persistent），铁律：**授权只由人的动作进入和撤销，不由时钟改变**——没有到期时间，没有剩余毫秒，持续授权等再久都不失效（回归测试用 35 秒等待证明这一点）。人有三条通道：问答卡片上点「允许」、Shift+Space 热键随时接管或撤销、JSON Lines 审计日志事后追溯（只记状态机动作与来源，不记任何按键内容）。点击闸门顺序是授权 → 参数 → 越界 → 消费，失败路径不浪费单次授权。键盘另走一条独立的一次性通道：**persistent 永不放行键盘**，每一次键入都必须单独点头。
+V1.3 起授权只有三态：`unauthorized` / `pending-persistent` / `persistent`。铁律：**授权只由人的动作进入和撤销，不由时钟改变**——没有到期时间，没有剩余毫秒，持续授权等再久都不失效（回归测试用 35 秒等待证明这一点）。
+
+- **进入授权**：按 Shift+Space 直接进入持续授权；或模型调 `vp_request_auth(mode='persistent')`，你在问答卡片上确认一次。
+- **急停**：任何时候再按一次 Shift+Space，立即回到 `unauthorized`。这是物理热键，不经过模型、不依赖宿主 UI。
+- **未授权即拦截**：`vp_click` / `vp_click_relative` / `vp_type` / `vp_key` 在未授权时直接抛错并提示人类开启持续授权，不会自己弹卡片。
+- **审计**：JSON Lines 记录每次授权迁移，以及每次注入的放行/拒绝（`actionAllowed` / `actionDenied`），只记动作与工具名，不记任何按键内容。
+
+为什么取消单次授权：V1.2.2 实测发现，点卡片上的「允许」会把焦点抢回 DSH 窗口，紧接着的注入就落进错误窗口。V1.3 让键盘与鼠标共用持续授权，注入前不再有任何焦点跳转。
 
 <!-- 配图位 1：授权问答卡片截图（宿主内 vp_request_auth 弹出的人类确认卡片） -->
 
@@ -31,26 +38,31 @@
 | `vp_screenshot` | 截主屏全屏，返回 `shotId`——后续一切操作的句柄。 |
 | `vp_screenshot_diff` | 与历史截图逐像素差分，输出差异区域 + 网格放大图。 |
 | `vp_wait_change` | 高频轮询等待屏幕变化，变化即返回；超时不消耗 shotId。 |
-| `vp_click` | 按绝对物理坐标点击（内部换算逻辑坐标，需已授权）。 |
-| `vp_click_relative` | 在差分区域的网格图内按相对百分比点击（需已授权）。 |
-| `vp_type` | 在当前焦点输入一段文本（Unicode 直注，中英文通吃；**绝不自动回车**）。 |
-| `vp_key` | 发送一次按键或组合键（enter / tab / esc / ctrl+c）；**回车只能由它触发**。 |
-| `vp_request_auth` | 请求人类授权（once / persistent），经宿主问答卡片等待确认。 |
+| `vp_click` | 按绝对物理坐标点击（内部换算逻辑坐标，需持续授权）。 |
+| `vp_click_relative` | 在差分区域的网格图内按相对百分比点击（需持续授权）。 |
+| `vp_type` | 在当前焦点输入一段文本（Unicode 直注，中英文通吃；**绝不自动回车**；需持续授权）。 |
+| `vp_key` | 发送一次按键或组合键（enter / tab / esc / ctrl+c）；**回车只能由它触发**；需持续授权。 |
+| `vp_request_auth` | 请求人类开启持续授权（仅 `mode='persistent'`），经宿主问答卡片等待确认。 |
 | `vp_auth_status` | 只读查询授权状态、热键可用性与审计日志路径。 |
+| `vp_summarize` | **收工必调**：归档关键截图、写入总结，清空其余全部临时碎片。 |
 
-## 工具选择纪律（Tool Use vs Computer Use）
+## 语义级记忆压缩（vp_summarize）
 
-这段纪律内嵌在全部 9 个工具的 description 开头——决定「用哪个工具」比决定「怎么点」更早发生：
+临时图会跨会话堆积。`vp_summarize` 让模型在**一个任务周期结束、准备收工或切换任务时**主动做一次收尾：
 
-- **首选 Tool Use**：任务能通过 API、读取文件或专属工具完成（读 Excel、取网页源码），绝对不要用视觉截图去点击——专属工具更准、更快。
-- **Computer Use 兜底**：只有遇到「没有 API 的 GUI 程序」「必须跨软件协同操作」「网页有反爬/验证码」时，才动用 `vp_screenshot` 等视觉工具。
-- **人机分工**：视觉操作极度依赖屏幕状态。需要输入文字时，先 `vp_click` 点中目标输入框，再 `vp_type` 输入内容，最后 `vp_key` 发 `enter` 确认。
+1. `keepShotIds` 里的关键截图（例如「初始页」和「结果页」）被移进 `archives/` 子目录，索引路径同步更新——归档后仍然可以做差分回看；
+2. `summary` 连同本次保留清单追加写入 `archive-summary.txt`；
+3. 当前目录下其余所有 `vp-shot-*`、`vp-diff-*`、`vp-grid-*` 立即删除，返回各类碎片数量。
 
-## 键盘注入：逐次点头，绝不继承持续授权
+**保护区**：`audit.log`（证据链）、`shot-index.json`（shotId 播种与相对点击依赖）、`archives/`（冷存储，一次归档永久保留）永远不会被删除。被清理掉的 shotId 在索引里保留条目，避免 `nextShotId` 回退导致旧 shotId 静默指向新截图；此时对它们做差分/等待会得到「文件已被 vp_summarize 清理，请重新截图」的明确错误。
 
-键盘能力分两个工具：`vp_type` 负责输入文本，`vp_key` 负责发送按键与组合键。铁律有三条：
+与 `paths.js` 里的 `cleanupVisualFragments`（启动时删 3 天前的 diff/grid）**不冲突**：那个是按时间的兜底，只碰 diff/grid；本工具是按语义的主清理，目标集合是它的超集。
 
-1. **键盘永远逐次经人类确认**——即使当前处于持续授权（persistent）也一样。持续授权只对鼠标点击有效；键盘每次都要单独弹卡片、单独点头。授权状态机里键盘走独立的一次性通道（`keyboardAuthorized`），与鼠标的 `persistent` 彻底分开，撤销、取消、重置都会一并清空。
+## 键盘注入：与鼠标共用持续授权
+
+键盘能力分两个工具：`vp_type` 负责输入文本，`vp_key` 负责发送按键与组合键。V1.3 起键盘不再有独立的逐次确认通道，规则只有三条：
+
+1. **键盘与鼠标共用 `checkCanClick()`**——`persistent` 下两者一律直接放行，`unauthorized` 下一律直接拦截。注入前不再弹卡片，因此不会出现「点允许 → 焦点跳回 DSH → 注入落错窗口」。
 2. **`vp_type` 绝不自动发送 Enter**——回车只能由 `vp_key` 单独触发，且必须在 `vp_key` 的 `thought` 里说明意图。
 3. **每个动作工具都要写旁白**——`vp_click` / `vp_click_relative` / `vp_type` / `vp_key` 都带必填的 `thought` 参数，用一句自然语言说明当前动作，原样回显在返回 JSON 里，作为给人看的进度旁白。
 
@@ -69,7 +81,7 @@ robot-ts 有两条注入通道，本插件按键的性质分流：
 
 ## 长程任务工作流（The OSA V Loop）
 
-这段协议内嵌在全部 9 个工具的 description 里，模型每次调用都会被提醒：
+这段协议内嵌在全部 10 个工具的 description 里，模型每次调用都会被提醒：
 
 1. **观察 Observe**——每步开始前，用截图或差分确认当前屏幕状态。
 2. **行动 Act**——点击目标（绝对坐标或相对百分比）。
@@ -88,11 +100,11 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add dsh-copilot-vision
 
 # 或从本地 tarball 安装（开发调试）
 npm pack
-DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.2.0.tgz
+DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.3.1.tgz
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
-- **授权**：模型调 `vp_request_auth`，你在卡片上确认；或随时 Shift+Space 进入持续授权、再按撤销。
+- **授权**：按 Shift+Space 开启或撤销持续授权；模型也可调 `vp_request_auth(mode='persistent')` 请求，你在卡片上确认一次。单次授权已取消。
 - **平台**：仅 Windows、仅本地主屏。pnpm 11 拦截构建脚本时，在 profile 的 `pnpm-workspace.yaml` 中允许 `robot-ts` 构建；native 缺失时插件仍可加载，调用时返回可读错误。
 - **落盘**：截图、索引、审计日志默认在 `os.tmpdir()/vision-pilot-shots/`，`VP_SHOT_DIR` 可整体重定向。
 - **迭代**：tarball 是快照，同版本重新 `add` 会被判 "Already up to date"——改源码后标准流程是 `npm pack` → `remove` → `add`。
@@ -105,18 +117,19 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 - **鼠标移动不可检测**：Windows 屏幕捕获不含硬件光标，挪鼠标不产生任何像素变化。
 - **热键无法区分真人与合成按键**：按键事件流不携带注入标记，审计日志只作事后追溯、不作防伪。真正的护栏在插件之外——宿主安全分类器与操作纪律。
 - **索引并发**：截图索引整份覆盖写、不做跨进程并发保护，多进程共用 `VP_SHOT_DIR` 会互相覆盖；回归测试一律用独立目录。
-- **临时目录卫生**：超过 3 天的差分/网格切片（`vp-diff-*` / `vp-grid-*`）会在插件启动时被自动清理，基准截图（`vp-shot-*`）和审计日志永久保留。
+- **临时目录卫生**：超过 3 天的差分/网格切片（`vp-diff-*` / `vp-grid-*`）会在插件启动时被自动清理；模型在收工时调用 `vp_summarize` 会把关键截图归档到 `archives/` 并清空其余全部碎片。基准截图（`vp-shot-*`）、审计日志、索引与 `archives/` 永久保留。
 
 ## 本地验证
 
 > 以下脚本为开发期本机验证用，含本机绝对路径，**不随仓库与 npm 包分发**（`.gitignore` 已排除 `test-*.mjs`）。克隆仓库后需自备对应脚本。
 
 ```bash
-node test-mvp.mjs        # 五态授权 + 热键/卡片竞态 + 无时钟衰减（约 45s，真实点击屏幕中心）
+node test-mvp.mjs        # 三态授权 + 热键急停/接管 + 无时钟衰减（约 45s，真实点击屏幕中心）
 node test-diff.mjs       # 差分与索引（单元层不碰屏幕；--integration 需配合动屏）
 node test-relative.mjs   # 网格渲染 + 相对坐标换算 + 未授权闸门（不截图、不注入）
 node test-wait.mjs       # 轮询语义（--integration 配合静屏/动屏/假基线）
-node test-keyboard.mjs   # 键名解析 + 注入通道分流 + 键盘授权闸门（--live 会真的抢一次键盘焦点）
+node test-keyboard.mjs   # 键名解析 + 注入通道分流 + 持续授权闸门（--live 会真的抢一次键盘焦点）
+node test-summarize.mjs  # 记忆压缩：5 张截图保留 2 张，校验清理、保护区与幂等（不碰屏幕）
 ```
 
 ---

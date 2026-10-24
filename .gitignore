@@ -9,7 +9,7 @@ dsh-copilot-vision-*.tgz
 # 依赖
 node_modules/
 
-# 本机验证脚本（含 C:/Users/imf 等本机绝对路径，不进仓库）
+# 本机验证脚本（含本机绝对路径，不进仓库）
 test-*.mjs
 
 # 环境变量与密钥（绝不入库）
