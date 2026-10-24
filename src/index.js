@@ -11,7 +11,7 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createPlugin } from './plugin.js'
 import { startHotkey } from './hotkey.js'
-import { togglePersistent } from './auth.js'
+import { togglePersistent, revokeAll } from './auth.js'
 import { cleanupVisualFragments } from './paths.js'
 
 export const name = 'dsh-copilot-vision'
@@ -29,6 +29,12 @@ export function apply(ctx) {
     startHotkey({
       onToggle: () => {
         togglePersistent()
+      },
+      // 急停通道失效 = 不能继续相信 persistent：先摘掉热键可用标记，再强制回 unauthorized。
+      onUnavailable: (reason) => {
+        hotkeyState.available = false
+        hotkeyState.error = reason
+        revokeAll('eventtap')
       },
     }).then((started) => {
       hotkeyState.available = started.available

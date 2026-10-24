@@ -14,6 +14,7 @@ import { PNG } from 'pngjs'
 import pixelmatch from 'pixelmatch'
 import { loadRobotTs } from './robot-ts.js'
 import { get, assertShotFileExists } from './shot-index.js'
+import { checkCanClick, getAuthEpoch } from './auth.js'
 import { screenshotAction } from './actions.js'
 import { diffPair, connectedComponents, DEFAULT_MIN_REGION_AREA } from './diff.js'
 
@@ -75,6 +76,19 @@ export async function waitChangeAction({
   assertShotFileExists(baseline, baselineMeta, 'vp_wait_change')
   const baselineImg = readPng(baselineMeta.path)
 
+  // 等待本身不要求授权；只有「带着持久授权开始等」的调用会被撤销打断。
+  // 记在会话创建之前，这样建会话期间发生的撤销在第一次轮询时就能发现。
+  const startedAllowed = checkCanClick().allowed
+  const startedEpoch = getAuthEpoch()
+  const assertWaitGrant = async () => {
+    if (!startedAllowed) return
+    // 让排队的撤销回调先落地，再同步复核；epoch 变化（含撤销后立刻重授权）一律中断。
+    await Promise.resolve()
+    if (!checkCanClick().allowed || getAuthEpoch() !== startedEpoch) {
+      throw new Error('授权已被撤销，等待中断')
+    }
+  }
+
   const { Session } = loadRobotTs()
   const session = await Session.create()
   const startedAt = Date.now()
@@ -106,6 +120,7 @@ export async function waitChangeAction({
     const mask = new Uint8Array(pixels)
 
     for (;;) {
+      await assertWaitGrant()
       const tickStartedAt = Date.now()
       const frame = await session.screen.captureMonitor(primary.id)
       const current = frame.toBuffer()
@@ -123,6 +138,8 @@ export async function waitChangeAction({
       }
       // 已经开始的这一帧一定跑完，所以超时路径上的 waitedMs 必然 >= timeoutMs。
       if (waitedMs >= timeoutMs) break
+      // 睡之前再查一次：把「撤销 → 醒来才发现」的延迟压到一帧以内。
+      await assertWaitGrant()
       await sleep(Math.max(0, pollIntervalMs - (Date.now() - tickStartedAt)))
     }
   } finally {

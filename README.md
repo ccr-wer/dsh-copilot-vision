@@ -18,6 +18,9 @@ V1.3 起授权只有三态：`unauthorized` / `pending-persistent` / `persistent
 
 - **进入授权**：按 Shift+Space 直接进入持续授权；或模型调 `vp_request_auth(mode='persistent')`，你在问答卡片上确认一次。
 - **急停**：任何时候再按一次 Shift+Space，立即回到 `unauthorized`。这是物理热键，不经过模型、不依赖宿主 UI。
+- **热键失效即收权（Fail-Closed）**：热键是急停的唯一通道，它一旦失效就不能继续留着持续授权。EventTap 启动失败、监听线程退出、心跳（默认每 2 秒）发现钩子不再活跃，都会立刻把状态强制收回 `unauthorized` 并写一条 `revokeAll` 审计；不会出现「授权还在、却按不动撤销」的状态。
+- **撤销与注入竞态**：每个动作在放行时记下授权代数，真正调用 robot-ts 前再用微任务同步复核一次。人按撤销的瞬间，正在飞的这一下最多落到「已执行的移动」为止，后续注入立即中止；已经排队的其他动作一并作废。
+- **等待可被打断**：`vp_wait_change` 轮询期间一旦授权被撤销，立刻抛「授权已被撤销，等待中断」，不会空等到超时。
 - **未授权即拦截**：`vp_click` / `vp_click_relative` / `vp_type` / `vp_key` 在未授权时直接抛错并提示人类开启持续授权，不会自己弹卡片。
 - **审计**：JSON Lines 记录每次授权迁移，以及每次注入的放行/拒绝（`actionAllowed` / `actionDenied`），只记动作与工具名，不记任何按键内容。
 
@@ -100,7 +103,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add dsh-copilot-vision
 
 # 或从本地 tarball 安装（开发调试）
 npm pack
-DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.3.1.tgz
+DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.3.2.tgz
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
@@ -116,6 +119,8 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 - **聊天窗口自干扰**：宿主聊天窗口的流式重绘会被当成屏幕变化（实测覆盖率约为变化门限的 14 倍）。等页面加载时，先把聊天窗口移出主屏或最小化。
 - **鼠标移动不可检测**：Windows 屏幕捕获不含硬件光标，挪鼠标不产生任何像素变化。
 - **热键无法区分真人与合成按键**：按键事件流不携带注入标记，审计日志只作事后追溯、不作防伪。真正的护栏在插件之外——宿主安全分类器与操作纪律。
+- **静默摘钩不可观测**：心跳只能读到 robot-ts 暴露的「监听线程是否存活」。Windows 若在消息循环仍在跑的情况下静默卸掉低层钩子，绑定层看不到；此时心跳无法判定失效。插件启动失败与线程退出这两条路径已按 Fail-Closed 处理。
+- **无热键时的残余风险**：EventTap 启动即不可用时，插件不会自动收权（启动状态本就是 `unauthorized`），但人仍可通过 `vp_request_auth` 卡片确认进入 `persistent`——此时没有物理急停通道。是否放行由人在卡片上判断；本轮未禁止该路径。
 - **索引并发**：截图索引整份覆盖写、不做跨进程并发保护，多进程共用 `VP_SHOT_DIR` 会互相覆盖；回归测试一律用独立目录。
 - **临时目录卫生**：超过 3 天的差分/网格切片（`vp-diff-*` / `vp-grid-*`）会在插件启动时被自动清理；模型在收工时调用 `vp_summarize` 会把关键截图归档到 `archives/` 并清空其余全部碎片。基准截图（`vp-shot-*`）、审计日志、索引与 `archives/` 永久保留。
 
@@ -124,7 +129,8 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 > 以下脚本为开发期本机验证用，含本机绝对路径，**不随仓库与 npm 包分发**（`.gitignore` 已排除 `test-*.mjs`）。克隆仓库后需自备对应脚本。
 
 ```bash
-node test-mvp.mjs        # 三态授权 + 热键急停/接管 + 无时钟衰减（约 45s，真实点击屏幕中心）
+node test-hotkey.mjs     # 热键 Fail-Closed：触发沿、心跳失效/抛错、启动失败、dispose 幂等（全假 Session）
+node test-mvp.mjs        # 三态授权 + 热键急停/接管 + 撤销竞态 + 等待中断 + 无时钟衰减（约 45s，真实点击屏幕中心）
 node test-diff.mjs       # 差分与索引（单元层不碰屏幕；--integration 需配合动屏）
 node test-relative.mjs   # 网格渲染 + 相对坐标换算 + 未授权闸门（不截图、不注入）
 node test-wait.mjs       # 轮询语义（--integration 配合静屏/动屏/假基线）

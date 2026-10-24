@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { physicalToLogical, relativeToPhysical } from './coords.js'
 import { parseKeySpec, resolveUnicodeChar } from './keys.js'
 import { loadRobotTs } from './robot-ts.js'
-import { checkCanClick, getStatus } from './auth.js'
+import { checkCanClick, getAuthEpoch, getStatus } from './auth.js'
 import { logState } from './audit.js'
 import { resolveShotsDir } from './paths.js'
 import { get, nextShotId, record } from './shot-index.js'
@@ -77,9 +77,29 @@ function denyInjection(tool, gate, extra = {}) {
 }
 
 /** 放行注入后记一笔；不改变授权状态，只留「这一次真的注入了」的证据。 */
-function allowInjection(tool, extra = {}) {
+function allowInjection(tool, extra = {}, grantedState = getStatus().state) {
+  logState('actionAllowed', 'tool', grantedState, getStatus().state, { tool, ...extra })
+}
+
+/** 放行快照：决策时的授权代数与状态，注入前用它做最后一次同步复核。 */
+function captureGrant(tool) {
+  const gate = checkCanClick()
+  if (!gate.allowed) denyInjection(tool, gate)
+  return { epoch: getAuthEpoch(), state: getStatus().state }
+}
+
+/**
+ * 注入前的最后闸门。动作在放行之后还要建会话、取显示器、换算坐标，这期间人可能已经
+ * 按了 Shift+Space。先让出一个微任务，给已排队的撤销回调落地；再做同步复核。
+ * 复核通过到 native 调用之间没有 await，JS 单线程保证不会再有授权翻转插进来。
+ * 用 epoch 而不是只看 allowed：撤销后又立刻授权也算翻转，旧动作不得继续飞。
+ */
+async function assertGrantStillValid(tool, grant) {
+  await Promise.resolve()
+  if (checkCanClick().allowed && getAuthEpoch() === grant.epoch) return
   const state = getStatus().state
-  logState('actionAllowed', 'tool', state, state, { tool, ...extra })
+  logState('actionDenied', 'tool', state, state, { tool, reason: '授权已被撤销' })
+  throw new Error(`授权已被撤销，动作已中止（${tool}）`)
 }
 
 /**
@@ -95,6 +115,7 @@ export async function clickAction(args = {}) {
     denyInjection('vp_click', gate,
       Number.isFinite(x) && Number.isFinite(y) ? { physical: { x, y } } : {})
   }
+  const grant = { epoch: getAuthEpoch(), state: getStatus().state }
   const { button = 'left' } = args
 
   if (!Number.isFinite(x) || !Number.isFinite(y)) {
@@ -104,11 +125,11 @@ export async function clickAction(args = {}) {
     throw new Error(`vp_click: 坐标不能为负数，收到 x=${x}, y=${y}`)
   }
 
-  return await injectClick({ x, y, button, thought: args.thought, tool: 'vp_click' })
+  return await injectClick({ x, y, button, thought: args.thought, tool: 'vp_click', grant })
 }
 
 /** 真实注入的共用实现：参数校验、越界检查、换算逻辑坐标、移动并点击。 */
-async function injectClick({ x, y, button = 'left', thought, tool }) {
+async function injectClick({ x, y, button = 'left', thought, tool, grant }) {
   const { Session, MouseButton } = loadRobotTs()
   const buttons = {
     left: MouseButton.Left,
@@ -135,9 +156,12 @@ async function injectClick({ x, y, button = 'left', thought, tool }) {
     }
 
     const logical = physicalToLogical({ x, y }, primary.scaleFactor)
+    await assertGrantStillValid(tool, grant)
     await session.mouse.move(logical)
+    // 移动本身已是一次注入；点击前再复核一次，撤销发生在 move 期间就停在这里。
+    await assertGrantStillValid(tool, grant)
     await session.mouse.click(buttons[button])
-    allowInjection(tool, { physical: { x, y }, button })
+    allowInjection(tool, { physical: { x, y }, button }, grant.state)
 
     return {
       thought: normalizeThought(thought, `点击屏幕物理坐标 (${x}, ${y})`),
@@ -158,10 +182,7 @@ async function injectClick({ x, y, button = 'left', thought, tool }) {
  * V1.3 取消了键盘独立通道——单次确认卡片会把焦点抢回 DSH，注入反而落错窗口。
  */
 export async function typeAction(args = {}) {
-  const gate = checkCanClick()
-  if (!gate.allowed) {
-    denyInjection('vp_type', gate)
-  }
+  const grant = captureGrant('vp_type')
 
   const { text } = args
   if (typeof text !== 'string' || text.length === 0) {
@@ -179,8 +200,9 @@ export async function typeAction(args = {}) {
     }
     // robot-ts 的 typeText 走 KEYEVENTF_UNICODE 直接注入码点，与键盘布局无关，
     // 中文/emoji 都能原样打出来，不需要剪贴板中转。
+    await assertGrantStillValid('vp_type', grant)
     await session.keyboard.typeText(text)
-    allowInjection('vp_type', { chars: text.length })
+    allowInjection('vp_type', { chars: text.length }, grant.state)
     return {
       typed: text,
       method: 'unicode',
@@ -215,10 +237,7 @@ export function describeKeySpec(key) {
  *     这样组合键语义是真的（Ctrl+V 实测能粘上），space 也能激活聚焦的按钮。
  */
 export async function keyAction(args = {}) {
-  const gate = checkCanClick()
-  if (!gate.allowed) {
-    denyInjection('vp_key', gate)
-  }
+  const grant = captureGrant('vp_key')
 
   const { key } = args
   const { Session, Key, Modifier } = loadRobotTs()
@@ -236,12 +255,13 @@ export async function keyAction(args = {}) {
     if (unicodeChar !== null && !session.capabilities.canTypeUnicode) {
       throw new Error('当前宿主环境不支持 Unicode 文本注入（canTypeUnicode=false）')
     }
+    await assertGrantStillValid('vp_key', grant)
     if (unicodeChar !== null) {
       await session.keyboard.typeChar(unicodeChar.codePointAt(0))
     } else {
       await session.keyboard.tap(spec.code, spec.modifiers)
     }
-    allowInjection('vp_key', { key: spec.spec })
+    allowInjection('vp_key', { key: spec.spec }, grant.state)
     return {
       key: spec.spec,
       keyName: spec.keyName,
@@ -288,10 +308,7 @@ export function resolveRelativeTarget({ shotId, index, xPercent, yPercent }) {
  * 授权 → 参数合法性 → 越界 → 注入，所以未授权时不会读索引、不会新建 robot-ts 会话。
  */
 export async function clickRelativeAction(args = {}) {
-  const gate = checkCanClick()
-  if (!gate.allowed) {
-    denyInjection('vp_click_relative', gate)
-  }
+  const grant = captureGrant('vp_click_relative')
 
   const { shotId, index, xPercent, yPercent, button = 'left' } = args
   const { bbox, physical } = resolveRelativeTarget({ shotId, index, xPercent, yPercent })
@@ -301,6 +318,7 @@ export async function clickRelativeAction(args = {}) {
     button,
     thought: args.thought,
     tool: 'vp_click_relative',
+    grant,
   })
   return {
     thought: clicked.thought,

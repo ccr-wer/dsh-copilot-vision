@@ -14,6 +14,7 @@ export const AUDIT_ACTIONS = [
   'confirmPending',
   'cancelPending',
   'togglePersistent',
+  'revokeAll',
   'actionAllowed',
   'actionDenied',
 ]

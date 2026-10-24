@@ -28,6 +28,9 @@ const state = {
   /** @type {{requestId: string, mode: 'persistent', requestedAt: number, controller: AbortController} | null} */
   pendingRequest: null,
   requestSeq: 0,
+  // 放行态的代数：每次 persistent 翻转 +1。动作在 checkCanClick() 放行时记下它，
+  // 注入前再比一次——即使中途「撤销又立刻授权」，旧动作也不会带着旧授权继续飞。
+  epoch: 0,
 }
 
 /** 当前授权状态（只读快照，不含内部的 AbortController）。 */
@@ -109,6 +112,7 @@ export function confirmPending(requestId) {
   const previousState = getStatus().state
   state.pendingRequest = null
   state.persistent = true
+  state.epoch += 1
   request.controller.abort({ code: 'AUTH_CANCELLED', reason: '已由人确认' })
   audit('confirmPending', 'user-question', previousState, { mode: request.mode, requestId })
   return { ...getStatus(), confirmed: true }
@@ -135,8 +139,28 @@ export function togglePersistent(source = 'hotkey') {
     state.persistent = true
     clearPending({ code: 'AUTH_CANCELLED', reason: '热键接管' })
   }
+  state.epoch += 1
   audit('togglePersistent', source, previousState)
   return getStatus()
+}
+
+/**
+ * 系统侧的强制回收：EventTap 失效时调用，无条件回到 unauthorized。
+ * 与 togglePersistent 的区别是它只会撤销、不会开启；pending 一并清掉，
+ * 因为这个状态机已经没有可信的人类急停通道了（fail-closed）。
+ */
+export function revokeAll(reason = 'system') {
+  const previousState = getStatus().state
+  state.persistent = false
+  clearPending({ code: 'AUTH_CANCELLED', reason })
+  state.epoch += 1
+  audit('revokeAll', 'system', previousState, { reason })
+  return getStatus()
+}
+
+/** 当前放行态的代数（见 state.epoch 的注释）。 */
+export function getAuthEpoch() {
+  return state.epoch
 }
 
 /**
@@ -158,6 +182,7 @@ export function _resetForTests() {
   state.persistent = false
   clearPending({ code: 'AUTH_CANCELLED', reason: '测试重置' })
   state.requestSeq = 0
+  state.epoch += 1
 }
 
 /** 测试专用：读内部标志位（getStatus 看不到 persistent 期间挂着的 pending 详情之外的东西）。 */
