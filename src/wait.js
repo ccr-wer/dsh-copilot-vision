@@ -8,7 +8,11 @@
 // 所以轮询只碰 toBuffer()，一次落盘都不做；只有确认变化、退出循环的那一帧
 // 才走 screenshotAction() 落盘写索引，并基于那张「正式」截图生成局部裁剪图。
 //
-// 边界：仍然只有主屏全屏；不做区域等待、不做多显示器、不缓存历史帧。
+// 呼吸阀：连续没有变化时逐步降频（100ms → 200ms → 500ms），
+// 减少底层截屏句柄的申请频率，给系统沙箱/ACL 压力留出余量。
+//
+// 边界：只有主屏全屏；可选 region 只观察局部区域（区域外变化彻底忽略）；
+// 不做多显示器、不缓存历史帧。
 import { readFileSync } from 'node:fs'
 import { PNG } from 'pngjs'
 import pixelmatch from 'pixelmatch'
@@ -16,17 +20,33 @@ import { loadRobotTs } from './robot-ts.js'
 import { get, assertShotFileExists } from './shot-index.js'
 import { checkCanClick, getAuthEpoch } from './auth.js'
 import { screenshotAction } from './actions.js'
-import { diffPair, connectedComponents, DEFAULT_MIN_REGION_AREA } from './diff.js'
+import { diffPair, connectedComponents, crop, normalizeRegion, DEFAULT_MIN_REGION_AREA } from './diff.js'
 
 export const DEFAULT_POLL_INTERVAL_MS = 100
 export const DEFAULT_TIMEOUT_MS = 3000
 // 工具参数由模型给，不设上限就等于让它自己挑一个能挂住宿主的等待时长。
 export const MAX_TIMEOUT_MS = 30000
-// 过滤噪声后的差异像素占整屏比例超过它才算「变了」。光标/插入符闪烁约 400 像素
-// ≈ 1.7e-4，取一个数量级余量。
+// 过滤噪声后的差异像素占被比对区域（默认整屏，region 模式下为 region）
+// 比例超过它才算「变了」。光标/插入符闪烁约 400 像素 ≈ 1.7e-4，取一个数量级余量。
 export const DEFAULT_MIN_COVERAGE = 0.001
 
+// 呼吸阀档位（从开始等待算起的连续未变化时长）。
+export const BACKOFF_STEP_1_AFTER_MS = 1000
+export const BACKOFF_STEP_1_INTERVAL_MS = 200
+export const BACKOFF_STEP_2_AFTER_MS = 2000
+export const BACKOFF_STEP_2_INTERVAL_MS = 500
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * 动态降频：初始 baseIntervalMs，连续 1 秒没变化放宽到 200ms，
+ * 超过 2 秒没变化放宽到 500ms。档位是绝对值，与 base 无关。
+ */
+export function resolvePollInterval(waitedMs, baseIntervalMs = DEFAULT_POLL_INTERVAL_MS) {
+  if (waitedMs >= BACKOFF_STEP_2_AFTER_MS) return BACKOFF_STEP_2_INTERVAL_MS
+  if (waitedMs >= BACKOFF_STEP_1_AFTER_MS) return BACKOFF_STEP_1_INTERVAL_MS
+  return baseIntervalMs
+}
 
 function readPng(path) {
   return PNG.sync.read(readFileSync(path))
@@ -46,6 +66,8 @@ function changedPixels(mask, width, height, minArea) {
 
 /**
  * 轮询等待屏幕相对 baseline 发生变化。
+ * region 可选：只观察该局部区域（物理像素），区域外的任何变化（流式输出、闪烁）
+ * 都被彻底忽略；返回的 regions bbox/offset 仍是全屏绝对坐标。
  * 返回 changed=true 时带 currentShotId/regions/coverage（来自落盘后的正式截图），
  * 超时未变时只带 changed=false + waitedMs + timeout=true，不产生任何新截图。
  */
@@ -56,6 +78,7 @@ export async function waitChangeAction({
   pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
   minArea = DEFAULT_MIN_REGION_AREA,
   minCoverage = DEFAULT_MIN_COVERAGE,
+  region,
 } = {}) {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
     throw new Error(`vp_wait_change: timeoutMs 必须是 >=0 的数字，收到 ${timeoutMs}`)
@@ -75,6 +98,8 @@ export async function waitChangeAction({
   }
   assertShotFileExists(baseline, baselineMeta, 'vp_wait_change')
   const baselineImg = readPng(baselineMeta.path)
+  // region 校验先于会话创建：参数非法就不必去申请底层句柄。
+  const regionBox = normalizeRegion(region, baselineMeta.width, baselineMeta.height, 'vp_wait_change: ')
 
   // 等待本身不要求授权；只有「带着持久授权开始等」的调用会被撤销打断。
   // 记在会话创建之前，这样建会话期间发生的撤销在第一次轮询时就能发现。
@@ -115,24 +140,30 @@ export async function waitChangeAction({
       )
     }
 
-    const pixels = width * height
-    const output = new Uint8Array(pixels * 4)
-    const mask = new Uint8Array(pixels)
+    // region 模式下只比对该区域：baseline 裁一次，每帧把 captureMonitor 的整屏帧裁一块。
+    const cmpBaseline = regionBox === undefined ? baselineImg : crop(baselineImg, regionBox)
+    const cmpWidth = cmpBaseline.width
+    const cmpHeight = cmpBaseline.height
+    const cmpPixels = cmpWidth * cmpHeight
+    const output = new Uint8Array(cmpPixels * 4)
+    const mask = new Uint8Array(cmpPixels)
 
     for (;;) {
       await assertWaitGrant()
       const tickStartedAt = Date.now()
       const frame = await session.screen.captureMonitor(primary.id)
-      const current = frame.toBuffer()
+      const current = regionBox === undefined
+        ? frame.toBuffer()
+        : crop({ width, height, data: frame.toBuffer() }, regionBox).data
 
       // pixelmatch 在 diffMask 模式下只写「是差异」的那些像素，其余像素一个字节都不碰，
       // 所以复用缓冲必须先清零 —— 否则上一帧的差异会永久留在 mask 里。
       output.fill(0)
-      pixelmatch(baselineImg.data, current, output, width, height, { threshold, diffMask: true })
-      for (let i = 0; i < pixels; i++) mask[i] = output[i * 4 + 3] !== 0 ? 1 : 0
+      pixelmatch(cmpBaseline.data, current, output, cmpWidth, cmpHeight, { threshold, diffMask: true })
+      for (let i = 0; i < cmpPixels; i++) mask[i] = output[i * 4 + 3] !== 0 ? 1 : 0
 
       waitedMs = Date.now() - startedAt
-      if (changedPixels(mask, width, height, minArea) / pixels > minCoverage) {
+      if (changedPixels(mask, cmpWidth, cmpHeight, minArea) / cmpPixels > minCoverage) {
         fired = true
         break
       }
@@ -140,7 +171,8 @@ export async function waitChangeAction({
       if (waitedMs >= timeoutMs) break
       // 睡之前再查一次：把「撤销 → 醒来才发现」的延迟压到一帧以内。
       await assertWaitGrant()
-      await sleep(Math.max(0, pollIntervalMs - (Date.now() - tickStartedAt)))
+      const interval = resolvePollInterval(waitedMs, pollIntervalMs)
+      await sleep(Math.max(0, interval - (Date.now() - tickStartedAt)))
     }
   } finally {
     await session.dispose()
@@ -159,6 +191,7 @@ export async function waitChangeAction({
     currentShotId: current.shotId,
     threshold,
     minArea,
+    region: regionBox,
   })
 
   return {

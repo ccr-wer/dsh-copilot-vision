@@ -6,6 +6,8 @@
 //   - 额外产出的 gridPath 是按面积与单边长度自适应倍率的「网格放大镜」（小区域 4x / 中区域 2x / 大区域 1x，
 //     放大后单边不超过 2000 像素，见 render.js），
 //     它只用于目测/相对点击，不改变 localPath 的 1:1 语义；倍数随区域以 gridScale 字段返回。
+//   - 可选 region：只比对 (x,y) 起点的 width×height 局部（物理像素），区域外任何变化彻底忽略；
+//     返回的 bbox/offset 仍加回 region 偏移、是全屏绝对坐标，coverage 的分母是被比对区域面积。
 //   - 不做高频抽帧，只在调用时截一张当前图。
 //   - 尺寸/缩放不一致时直接抛错，不做任何重采样或硬算 —— 显示器或缩放变了，
 //     旧截图的坐标系已经不可信，勉强对齐只会给出错误坐标。
@@ -75,8 +77,8 @@ export function connectedComponents(mask, width, height) {
   return components
 }
 
-/** 从当前图裁出 bbox 大小的 PNG（原尺寸，不缩放）。 */
-function crop(source, bbox) {
+/** 从源图裁出 bbox 大小的 PNG（原尺寸，不缩放）。bbox 必须完全落在源图内。 */
+export function crop(source, bbox) {
   const out = new PNG({ width: bbox.width, height: bbox.height })
   for (let row = 0; row < bbox.height; row++) {
     const from = ((bbox.y + row) * source.width + bbox.x) * 4
@@ -90,11 +92,47 @@ function crop(source, bbox) {
   return out
 }
 
+/**
+ * 校验并归一化可选 region 参数（物理像素整数），返回 {x, y, width, height}；
+ * 未传返回 undefined。坐标契约上像素必须是整数——region 被裁剪与偏移换算共用，
+ * 非整数会同时污染 bbox 与覆盖率分母。
+ */
+export function normalizeRegion(region, screenWidth, screenHeight, tool = '') {
+  if (region === undefined) return undefined
+  if (region === null || typeof region !== 'object' || Array.isArray(region)) {
+    throw new Error(
+      `${tool}region 必须是 {x, y, width, height} 对象（物理像素），收到 ${JSON.stringify(region)}`,
+    )
+  }
+  const { x, y, width, height } = region
+  for (const key of ['x', 'y', 'width', 'height']) {
+    if (!Number.isInteger(region[key])) {
+      throw new Error(`${tool}region.${key} 必须是整数物理像素，收到 ${region[key]}`)
+    }
+  }
+  if (x < 0 || y < 0) {
+    throw new Error(`${tool}region 的 x/y 不能为负，收到 (${x}, ${y})`)
+  }
+  if (width < 1 || height < 1) {
+    throw new Error(`${tool}region 的 width/height 必须 >=1，收到 ${width}x${height}`)
+  }
+  if (x + width > screenWidth || y + height > screenHeight) {
+    throw new Error(
+      `${tool}region 越界：屏幕 ${screenWidth}x${screenHeight}，` +
+      `region (${x},${y}) ${width}x${height} 超出范围`,
+    )
+  }
+  return { x, y, width, height }
+}
+
 const formatDims = (meta) => `${meta.width}x${meta.height}@${meta.scaleFactor}`
 
 /**
  * 对两张已落盘的截图做差分。不碰屏幕，可被单元测试直接调用。
  * 两个 meta 都来自 shot-index（path/width/height/scaleFactor）。
+ * region 可选：只比对该局部区域（物理像素），区域外变化彻底忽略；
+ * 返回的 bbox/offset 已加回 region 偏移（全屏绝对坐标），
+ * coverage 分母为被比对区域面积（默认整屏，region 模式为 region 面积）。
  */
 export function diffPair({
   baselineMeta,
@@ -103,7 +141,8 @@ export function diffPair({
   currentShotId,
   threshold = 0.1,
   minArea = DEFAULT_MIN_REGION_AREA,
-}) {
+  region,
+} = {}) {
   if (
     baselineMeta.width !== currentMeta.width ||
     baselineMeta.height !== currentMeta.height ||
@@ -115,8 +154,12 @@ export function diffPair({
     )
   }
 
-  const baseline = readPng(baselineMeta.path)
-  const current = readPng(currentMeta.path)
+  const baselineFull = readPng(baselineMeta.path)
+  const currentFull = readPng(currentMeta.path)
+  const box = normalizeRegion(region, baselineFull.width, baselineFull.height)
+
+  const baseline = box === undefined ? baselineFull : crop(baselineFull, box)
+  const current = box === undefined ? currentFull : crop(currentFull, box)
   const width = baseline.width
   const height = baseline.height
 
@@ -133,6 +176,17 @@ export function diffPair({
   const kept = connectedComponents(mask, width, height)
     .filter((component) => component.pixels >= minArea)
     .sort((a, b) => b.pixels - a.pixels)
+    // 连通块是在被比对的（可能已裁剪的）图上算的；bbox 必须加回 region 偏移，
+    // 让下游拿到的永远是全屏绝对物理坐标（vp_click_relative 依赖这一点）。
+    .map((component) => ({
+      pixels: component.pixels,
+      bbox: {
+        x: component.bbox.x + (box?.x ?? 0),
+        y: component.bbox.y + (box?.y ?? 0),
+        width: component.bbox.width,
+        height: component.bbox.height,
+      },
+    }))
 
   const dir = resolveShotsDir()
   mkdirSync(dir, { recursive: true })
@@ -140,7 +194,7 @@ export function diffPair({
   const regions = kept.map((component, i) => {
     const bbox = component.bbox
     const localPath = join(dir, `vp-diff-${currentShotId}-${i + 1}.png`)
-    writeFileSync(localPath, PNG.sync.write(crop(current, bbox)))
+    writeFileSync(localPath, PNG.sync.write(crop(currentFull, bbox)))
     const region = {
       // offset 就是 bbox 左上角：局部图未放大，(0,0) 对应全局 offset。
       bbox,
@@ -167,6 +221,7 @@ export function diffPair({
   return {
     changed: regions.length > 0,
     regions,
+    // 分母是被比对的面积：默认整屏，region 模式下是 region 面积。
     coverage: regions.length === 0 ? 0 : changedPixels / (width * height),
     baselineShotId,
     currentShotId,
@@ -174,12 +229,13 @@ export function diffPair({
   }
 }
 
-/** 截一张当前图，与 baselineShotId 指向的历史截图做差分。 */
+/** 截一张当前图，与 baselineShotId 指向的历史截图做差分。region 可选：只比对局部区域。 */
 export async function diffAction({
   baseline,
   threshold = 0.1,
   minArea = DEFAULT_MIN_REGION_AREA,
-}) {
+  region,
+} = {}) {
   const baselineMeta = get(baseline)
   if (baselineMeta === undefined) {
     throw new Error(
@@ -187,6 +243,8 @@ export async function diffAction({
     )
   }
   assertShotFileExists(baseline, baselineMeta, 'vp_screenshot_diff')
+  // region 合法性先验：不合法就不必白截一张图（还白占一个 shotId）。
+  normalizeRegion(region, baselineMeta.width, baselineMeta.height, 'vp_screenshot_diff: ')
   const current = await screenshotAction()
   return diffPair({
     baselineMeta,
@@ -195,5 +253,6 @@ export async function diffAction({
     currentShotId: current.shotId,
     threshold,
     minArea,
+    region,
   })
 }

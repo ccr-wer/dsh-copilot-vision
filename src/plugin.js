@@ -47,6 +47,13 @@ const COVERAGE_WARNING =
   '如果界面是相同背景色（如白底）的元素位移或扩展，coverage 会非常低，但界面布局可能已经发生巨变。' +
   '判断界面是否发生重要改变，不要只看 coverage，要以返回的 regions 和 gridPath 的实际内容为准。'
 
+// 多尺度感知策略：流式输出/闪烁干扰下收缩注意力到 region，失配时回退全局重新定位。
+const MULTI_SCALE_STRATEGY =
+  '【多尺度感知策略】' +
+  '局部优先：如果屏幕有流式输出或闪烁干扰，请优先传入 region 参数，只盯住你关心的局部区域。' +
+  '失配回退：如果你在 region 内等待超时，说明目标可能发生偏移，此时绝对不要盲目重试，' +
+  '必须立刻调用 vp_screenshot 重新获取全屏视图，重新全局定位目标。'
+
 // 旁白要求：模型必须用一句自然语言说明自己在干什么，这句话会展示给用户。
 const THOUGHT_REQUIRED =
   '【必须写旁白】调用本工具时必须通过 thought 参数，用一句自然语言描述你当前正在做什么' +
@@ -62,7 +69,8 @@ const SCREENSHOT_DESCRIPTION =
   '调用 vp_click 时直接传图像上的物理像素坐标即可，换算由 vp_click 内部完成。' +
   '返回的 shotId 可用于 vp_screenshot_diff 的 baseline 参数。' +
   AGENT_PROTOCOL +
-  CONTEXT_DISCIPLINE
+  CONTEXT_DISCIPLINE +
+  MULTI_SCALE_STRATEGY
 
 const DIFF_DESCRIPTION =
   '把当前屏幕与一张历史截图做逐像素差分，返回连通差异区域及其局部裁剪图。' +
@@ -84,21 +92,30 @@ const DIFF_DESCRIPTION =
   'changed=false 表示没有超过噪声阈值的差异区域，不等于屏幕完全没变；要确认刚才的操作是否生效，建议看全屏。' +
   'baseline 与当前截图的宽高或 scaleFactor 不一致时直接报错（多半是换了显示器或改了缩放比例），' +
   '不做重采样硬算，请重新调用 vp_screenshot 取新的 baseline。' +
+  '可选 region：只比对以 (x,y) 为左上角的 width×height 局部区域（物理像素整数，原点主屏左上角），' +
+  '区域外的任何变化（如聊天区的流式输出、光标闪烁）都会被彻底忽略，适合在有背景干扰时只盯目标区域；' +
+  '此时返回的 regions bbox/offset 仍然加回了 region 偏移、是全屏绝对坐标（与 vp_click 一致，可直接换算），' +
+  'coverage 变为差异像素占 region 面积的比例；region 越界或含非整数直接报错。' +
   '每次调用都会真实截一张新屏幕并写入索引，返回的 currentShotId 可以继续当 baseline 用。' +
   AGENT_PROTOCOL +
-  CONTEXT_DISCIPLINE
+  CONTEXT_DISCIPLINE +
+  MULTI_SCALE_STRATEGY
 
 const WAIT_DESCRIPTION =
   '等待屏幕相对某张历史截图发生变化：工具内部循环截屏并逐像素比对，一旦变化面积超过阈值就立刻返回，' +
   '省得你因为「页面还没加载完」而反复调 vp_screenshot_diff 碰运气。' +
   'baseline 是 vp_screenshot 返回的 shotId（数字，不是路径）；timeoutMs 是最长等待毫秒（默认 3000，上限 30000）；' +
   'threshold 是像素色差阈值（0~1，默认 0.1），语义与 vp_screenshot_diff 相同。' +
-  '抽帧频率：内部每 100ms 一次（该间隔暂不对外可调）。实测 1920x1200 单帧 81~242ms' +
-  '（截屏 45~54ms + 比对 5~30ms + 连通块 12~15ms；屏上有大片差异时连通块更贵，屏越安静越快），' +
-  '帧耗时超过 100ms 时不等间隔直接接下一帧，所以本机实际节奏约 100~240ms 一帧，分辨率越高越慢。' +
+  '抽帧频率采用动态降频（呼吸阀）：初始每 100ms 一帧，连续 1 秒没有变化放宽到 200ms，' +
+  '超过 2 秒没变化放宽到 500ms，降低底层截屏句柄的申请频率；一旦检测到变化立刻返回。' +
+  '实测 1920x1200 单帧 81~242ms（截屏 45~54ms + 比对 5~30ms + 连通块 12~15ms；' +
+  '屏上有大片差异时连通块更贵，屏越安静越快），帧耗时超过当前间隔时不等间隔直接接下一帧。' +
   '轮询期间完全不落盘、不写截图索引，只在内存里比对；只有检测到变化并退出循环时才生成一张正式截图（落盘+写索引）。' +
   '因此超时未变不会消耗 shotId，也不会往截图目录堆文件。' +
-  '变化判据：过滤噪声（抗锯齿像素、以及小于 100 像素的连通块）后，差异像素占整屏比例 > 0.001 才算变了。' +
+  '变化判据：过滤噪声（抗锯齿像素、以及小于 100 像素的连通块）后，差异像素占被比对区域比例 > 0.001 才算变了。' +
+  '可选 region：只观察以 (x,y) 为左上角的 width×height 局部区域（物理像素整数），' +
+  '区域外的任何变化（如聊天区的流式输出）都会被彻底忽略，不会误触发返回；' +
+  '返回的 regions bbox/offset 仍是全屏绝对坐标，coverage 为差异像素占 region 面积的比例。' +
   '检测到变化返回 {changed:true, waitedMs, currentShotId, regions, coverage}，' +
   '其中 currentShotId 是那张正式截图，可以继续当后续 baseline 用。' +
   COVERAGE_WARNING +
@@ -113,7 +130,8 @@ const WAIT_DESCRIPTION =
   '排在第 12 个之后的区域没有 gridPath，会带 gridSkipped 说明。' +
   '它只负责「等」，不会替你制造变化：需要交互就先 vp_click，再用本工具等界面响应。' +
   AGENT_PROTOCOL +
-  CONTEXT_DISCIPLINE
+  CONTEXT_DISCIPLINE +
+  MULTI_SCALE_STRATEGY
 
 const CLICK_DESCRIPTION =
   '在主屏上点击一次鼠标。入参 x/y 为物理像素坐标，原点为主屏左上角，' +
@@ -630,6 +648,19 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
         default: 0.1,
         description: '像素色差阈值，0~1，越小越敏感，默认 0.1',
       },
+      region: {
+        type: 'object',
+        additionalProperties: false,
+        description: '可选。只比对这块局部区域（物理像素整数，原点主屏左上角）：' +
+          'x/y 为区域左上角（>=0），width/height 为区域宽高（>=1，不超出屏幕）。' +
+          '区域外的任何变化（流式输出、闪烁）被彻底忽略；返回的 bbox/offset 仍为全屏绝对坐标。',
+        properties: {
+          x: { type: 'number', required: true, description: '区域左上角 x（物理像素，>=0）' },
+          y: { type: 'number', required: true, description: '区域左上角 y（物理像素，>=0）' },
+          width: { type: 'number', required: true, description: '区域宽度（物理像素，>=1）' },
+          height: { type: 'number', required: true, description: '区域高度（物理像素，>=1）' },
+        },
+      },
     },
     output: {
       schema: {
@@ -704,6 +735,20 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
         type: 'number',
         default: 0.1,
         description: '像素色差阈值，0~1，越小越敏感，默认 0.1（语义同 vp_screenshot_diff）',
+      },
+      region: {
+        type: 'object',
+        additionalProperties: false,
+        description: '可选。只观察这块局部区域（物理像素整数，原点主屏左上角）：' +
+          'x/y 为区域左上角（>=0），width/height 为区域宽高（>=1，不超出屏幕）。' +
+          '区域外的任何变化（流式输出、闪烁）被彻底忽略，不会误触发返回；' +
+          '返回的 bbox/offset 仍为全屏绝对坐标。',
+        properties: {
+          x: { type: 'number', required: true, description: '区域左上角 x（物理像素，>=0）' },
+          y: { type: 'number', required: true, description: '区域左上角 y（物理像素，>=0）' },
+          width: { type: 'number', required: true, description: '区域宽度（物理像素，>=1）' },
+          height: { type: 'number', required: true, description: '区域高度（物理像素，>=1）' },
+        },
       },
     },
     output: {
