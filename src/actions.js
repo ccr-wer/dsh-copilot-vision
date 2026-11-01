@@ -175,13 +175,34 @@ async function injectClick({ x, y, button = 'left', thought, tool, grant }) {
   }
 }
 
+/** 每块注入的码点数：块边界就是急停的检查点，越大越省切换开销、撤销响应越粗。 */
+export const TYPE_CHUNK_SIZE = 40
+
+/**
+ * 按 Unicode 码点切分文本。
+ * 不能用 text.slice(i, i + 40)：那只按 UTF-16 码元计数，会把代理对（emoji、
+ * 扩展区汉字）从中间劈开，注入出两个孤立代理项。Array.from 按码点迭代，
+ * 每个 emoji 计数为 1 且永远完整落在一块里。
+ */
+export function chunkText(text, size = TYPE_CHUNK_SIZE) {
+  const points = Array.from(text)
+  const chunks = []
+  for (let i = 0; i < points.length; i += size) {
+    chunks.push(points.slice(i, i + size).join(''))
+  }
+  return chunks
+}
+
 /**
  * 在当前焦点位置输入文本。绝对不包含回车：回车只能由 vp_key 单独触发。
  *
  * 授权与鼠标完全一致：persistent 直接放行，unauthorized 直接拦截。
  * V1.3 取消了键盘独立通道——单次确认卡片会把焦点抢回 DSH，注入反而落错窗口。
+ *
+ * 整段一次 typeText 时，人按 Shift+Space 后剩余字符仍会打完；改为按块注入，
+ * 每块前复核一次授权，撤销最多让已开始的那一块落字，不会把全文继续倒完。
  */
-export async function typeAction(args = {}) {
+export async function typeAction(args = {}, { load = loadRobotTs } = {}) {
   const grant = captureGrant('vp_type')
 
   const { text } = args
@@ -189,7 +210,8 @@ export async function typeAction(args = {}) {
     throw new Error(`vp_type: text 必须是非空字符串，收到 ${typeof text === 'string' ? '空串' : typeof text}`)
   }
 
-  const { Session } = loadRobotTs()
+  const chunks = chunkText(text)
+  const { Session } = load()
   const session = await Session.create()
   try {
     if (!session.capabilities.canInjectKeyboard) {
@@ -200,9 +222,11 @@ export async function typeAction(args = {}) {
     }
     // robot-ts 的 typeText 走 KEYEVENTF_UNICODE 直接注入码点，与键盘布局无关，
     // 中文/emoji 都能原样打出来，不需要剪贴板中转。
-    await assertGrantStillValid('vp_type', grant)
-    await session.keyboard.typeText(text)
-    allowInjection('vp_type', { chars: text.length }, grant.state)
+    for (const chunk of chunks) {
+      await assertGrantStillValid('vp_type', grant)
+      await session.keyboard.typeText(chunk)
+    }
+    allowInjection('vp_type', { chars: text.length, chunks: chunks.length }, grant.state)
     return {
       typed: text,
       method: 'unicode',

@@ -11,6 +11,11 @@
 // 呼吸阀：连续没有变化时逐步降频（100ms → 200ms → 500ms），
 // 减少底层截屏句柄的申请频率，给系统沙箱/ACL 压力留出余量。
 //
+// 静默期：第一帧变化往往只是「渲染中途」——逐字输出、页面骨架先出内容后填。
+// 所以检出变化后不立刻交还控制权，而是再按 100ms 节奏观察，连续 3 次没有新的
+// 实质变化（约 300ms）才认为渲染稳定；期间又变了就重置计时。最多观察 2 秒，
+// 画面一直在变也会强行返回，避免拖死调用方（返回 settled=false）。
+//
 // 边界：只有主屏全屏；可选 region 只观察局部区域（区域外变化彻底忽略）；
 // 不做多显示器、不缓存历史帧。
 import { readFileSync } from 'node:fs'
@@ -35,6 +40,11 @@ export const BACKOFF_STEP_1_AFTER_MS = 1000
 export const BACKOFF_STEP_1_INTERVAL_MS = 200
 export const BACKOFF_STEP_2_AFTER_MS = 2000
 export const BACKOFF_STEP_2_INTERVAL_MS = 500
+
+// 静默期档位：检出变化后的稳定确认节奏。
+export const QUIET_CHECK_INTERVAL_MS = 100
+export const QUIET_STABLE_CHECKS = 3
+export const QUIET_MAX_WAIT_MS = 2000
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -65,10 +75,70 @@ function changedPixels(mask, width, height, minArea) {
 }
 
 /**
+ * 静默期：变化确认后再观察，等界面真正渲染稳定。
+ * 每 checkIntervalMs 抓一帧，与「最后一次观测到新变化的参考帧」比对：
+ *   - 出现新的实质变化（过滤噪声后 >0 像素）→ 计数清零，参考帧换成新帧；
+ *   - 连续 stableChecks 次没有再变 → settled=true 返回；
+ *   - 总时长达到 maxWaitMs → settled=false 强行返回（画面一直在变，不能拖死调用方）。
+ * capture 由调用方注入（生产是截屏 + region 裁剪，测试是脚本化帧序列），
+ * 判定标准与 diffPair 完全一致（同一 threshold 与连通块噪声下限），
+ * 避免「静默期说稳了、落盘那张说还在变」的自相矛盾。
+ */
+export async function settleQuiet({
+  reference,
+  capture,
+  width,
+  height,
+  threshold = 0.1,
+  minArea = DEFAULT_MIN_REGION_AREA,
+  checkIntervalMs = QUIET_CHECK_INTERVAL_MS,
+  stableChecks = QUIET_STABLE_CHECKS,
+  maxWaitMs = QUIET_MAX_WAIT_MS,
+  onTick,
+  sleepFn = sleep,
+  now = Date.now,
+} = {}) {
+  const pixels = width * height
+  const output = new Uint8Array(pixels * 4)
+  const mask = new Uint8Array(pixels)
+  const startedAt = now()
+  let ref = reference
+  let stable = 0
+  let checks = 0
+
+  for (;;) {
+    const tickStartedAt = now()
+    if (tickStartedAt - startedAt >= maxWaitMs) {
+      return { settled: false, quietMs: tickStartedAt - startedAt, checks, reference: ref }
+    }
+    if (onTick !== undefined) await onTick()
+    const current = await capture()
+    checks += 1
+
+    output.fill(0)
+    pixelmatch(ref, current, output, width, height, { threshold, diffMask: true })
+    for (let i = 0; i < pixels; i++) mask[i] = output[i * 4 + 3] !== 0 ? 1 : 0
+
+    if (changedPixels(mask, width, height, minArea) > 0) {
+      ref = current
+      stable = 0
+    } else {
+      stable += 1
+      if (stable >= stableChecks) {
+        return { settled: true, quietMs: now() - startedAt, checks, reference: ref }
+      }
+    }
+    // 与主循环同一节奏算法：帧耗时超过间隔就直接接下一帧，不额外等。
+    await sleepFn(Math.max(0, checkIntervalMs - (now() - tickStartedAt)))
+  }
+}
+
+/**
  * 轮询等待屏幕相对 baseline 发生变化。
  * region 可选：只观察该局部区域（物理像素），区域外的任何变化（流式输出、闪烁）
  * 都被彻底忽略；返回的 regions bbox/offset 仍是全屏绝对坐标。
- * 返回 changed=true 时带 currentShotId/regions/coverage（来自落盘后的正式截图），
+ * 检出变化后先过静默期（约 300ms 无新变化才算稳定，上限 2 秒），
+ * 再落盘生成正式截图。返回 changed=true 时带 currentShotId/regions/coverage/quietMs/settled，
  * 超时未变时只带 changed=false + waitedMs + timeout=true，不产生任何新截图。
  */
 export async function waitChangeAction({
@@ -119,6 +189,9 @@ export async function waitChangeAction({
   const startedAt = Date.now()
   let fired = false
   let waitedMs = 0
+  let quietMs = 0
+  let quietSettled = false
+  let quietFrame = null
 
   try {
     if (!session.capabilities.canCaptureScreen) {
@@ -165,6 +238,7 @@ export async function waitChangeAction({
       waitedMs = Date.now() - startedAt
       if (changedPixels(mask, cmpWidth, cmpHeight, minArea) / cmpPixels > minCoverage) {
         fired = true
+        quietFrame = current
         break
       }
       // 已经开始的这一帧一定跑完，所以超时路径上的 waitedMs 必然 >= timeoutMs。
@@ -173,6 +247,29 @@ export async function waitChangeAction({
       await assertWaitGrant()
       const interval = resolvePollInterval(waitedMs, pollIntervalMs)
       await sleep(Math.max(0, interval - (Date.now() - tickStartedAt)))
+    }
+
+    // 静默期：第一帧变化可能只是渲染中途（逐字输出、骨架屏），
+    // 再观察一小段，连续 3 次没有新的实质变化才交还控制权。
+    if (fired) {
+      const quiet = await settleQuiet({
+        reference: quietFrame,
+        capture: async () => {
+          const next = await session.screen.captureMonitor(primary.id)
+          return regionBox === undefined
+            ? next.toBuffer()
+            : crop({ width, height, data: next.toBuffer() }, regionBox).data
+        },
+        width: cmpWidth,
+        height: cmpHeight,
+        threshold,
+        minArea,
+        onTick: assertWaitGrant,
+      })
+      quietMs = quiet.quietMs
+      quietSettled = quiet.settled
+      // waitedMs 对调用方而言是「从开始等到返回」的总时长，静默期也算在内。
+      waitedMs = Date.now() - startedAt
     }
   } finally {
     await session.dispose()
@@ -198,6 +295,8 @@ export async function waitChangeAction({
     changed: result.changed,
     waitedMs,
     timeout: false,
+    quietMs,
+    settled: quietSettled,
     currentShotId: result.currentShotId,
     regions: result.regions,
     coverage: result.coverage,

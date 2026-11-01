@@ -107,7 +107,10 @@ const WAIT_DESCRIPTION =
   'baseline 是 vp_screenshot 返回的 shotId（数字，不是路径）；timeoutMs 是最长等待毫秒（默认 3000，上限 30000）；' +
   'threshold 是像素色差阈值（0~1，默认 0.1），语义与 vp_screenshot_diff 相同。' +
   '抽帧频率采用动态降频（呼吸阀）：初始每 100ms 一帧，连续 1 秒没有变化放宽到 200ms，' +
-  '超过 2 秒没变化放宽到 500ms，降低底层截屏句柄的申请频率；一旦检测到变化立刻返回。' +
+  '超过 2 秒没变化放宽到 500ms，降低底层截屏句柄的申请频率；这套降频只作用于「还没检测到变化」的等待阶段。' +
+  '静默期（Quiet-period）：检测到变化后不会立刻返回——第一帧变化往往只是渲染中途（文字逐字出现、骨架屏先出后填）。' +
+  '工具会再按每 100ms 观察一次，连续 3 次（约 300ms）没有新的实质变化，才认为界面渲染稳定并返回最终的变化区域；' +
+  '静默期内如果又出现新变化，计时自动重置；静默期最多观察 2 秒，画面持续在变也会强行返回当前结果（settled=false），避免拖死等待。' +
   '实测 1920x1200 单帧 81~242ms（截屏 45~54ms + 比对 5~30ms + 连通块 12~15ms；' +
   '屏上有大片差异时连通块更贵，屏越安静越快），帧耗时超过当前间隔时不等间隔直接接下一帧。' +
   '轮询期间完全不落盘、不写截图索引，只在内存里比对；只有检测到变化并退出循环时才生成一张正式截图（落盘+写索引）。' +
@@ -116,8 +119,10 @@ const WAIT_DESCRIPTION =
   '可选 region：只观察以 (x,y) 为左上角的 width×height 局部区域（物理像素整数），' +
   '区域外的任何变化（如聊天区的流式输出）都会被彻底忽略，不会误触发返回；' +
   '返回的 regions bbox/offset 仍是全屏绝对坐标，coverage 为差异像素占 region 面积的比例。' +
-  '检测到变化返回 {changed:true, waitedMs, currentShotId, regions, coverage}，' +
-  '其中 currentShotId 是那张正式截图，可以继续当后续 baseline 用。' +
+  '检测到变化返回 {changed:true, waitedMs, quietMs, settled, currentShotId, regions, coverage}，' +
+  '其中 waitedMs 是从开始等到返回的总时长（含静默期），quietMs 是静默期实际等待时长，' +
+  'settled=true 表示静默期内观测到连续稳定，false 表示 2 秒上限触顶、画面仍在变化；' +
+  'currentShotId 是那张正式截图，可以继续当后续 baseline 用。' +
   COVERAGE_WARNING +
   '超时未变返回 {changed:false, waitedMs, timeout:true}，没有 currentShotId 也没有 regions；' +
   '说明这段时间屏幕真的没动。如果返回 timeout: true，代表操作可能失败或界面卡死：' +
@@ -169,6 +174,8 @@ const TYPE_DESCRIPTION =
   '否则文字会打到当前焦点所在的任何控件里。' +
   '【授权与鼠标一致】：只要处于持续授权（persistent）就直接注入，不再弹卡片、不再抢焦点；' +
   "未授权时直接抛错，请提示用户按 Shift+Space，或调用 vp_request_auth(mode='persistent')。" +
+  '【急停细粒度】：文本按每 40 个字符（按 Unicode 码点，中文/emoji 不会被拆开）分块注入，' +
+  '每块之前都复核一次授权；用户按 Shift+Space 撤销后，最多再落下已经开始的那一块，剩余文本不再继续注入。' +
   THOUGHT_REQUIRED +
   AGENT_PROTOCOL
 
@@ -759,6 +766,8 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
           changed: { type: 'boolean', required: true },
           waitedMs: { type: 'number', required: true },
           timeout: { type: 'boolean', required: true },
+          quietMs: { type: 'number' },
+          settled: { type: 'boolean' },
           currentShotId: { type: 'number' },
           baselineShotId: { type: 'number' },
           coverage: { type: 'number' },
@@ -783,7 +792,8 @@ export function createPlugin(defineTool, ctx, hotkeyState = { available: false, 
       render: (_args, value) => [{
         type: 'text',
         text: value.changed
-          ? `等到变化了：相对 baseline #${value.baselineShotId} 在 ${value.waitedMs}ms 后检测到差异，` +
+          ? `等到变化了：相对 baseline #${value.baselineShotId} 在 ${value.waitedMs}ms 后返回` +
+            `（静默期 ${value.quietMs}ms，${value.settled ? '渲染已稳定' : '达到 2 秒上限、画面仍在变化'}），` +
             `已落盘为 current #${value.currentShotId}，坐标系 ${value.coordinateContract}\n` +
             `差异区域 ${value.regions.length} 处，coverage ${(value.coverage * 100).toFixed(2)}%` +
             `${value.coverage > 0.4 ? '（超过 40%，建议直接看全屏截图）' : ''}\n` +
