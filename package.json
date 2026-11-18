@@ -1,7 +1,7 @@
 {
   "name": "dsh-copilot-vision",
-  "version": "1.4.0",
-  "description": "为 DSH（DeepSeek Harness）打造的本地 Windows Computer Use 增强插件：纯 JS 视觉差分、网格位置编码、键盘注入、语义级记忆压缩、长程任务闭环与人机共驾授权。",
+  "version": "1.5.0",
+  "description": "为 DSH（DeepSeek Harness）打造的本地桌面 Computer Use 增强插件（Windows 完整验证，macOS 已接入）：纯 JS 视觉差分、网格位置编码、键盘注入、语义级记忆压缩、长程任务闭环与人机共驾授权。",
   "main": "./src/index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

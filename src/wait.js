@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs'
 import { PNG } from 'pngjs'
 import pixelmatch from 'pixelmatch'
 import { loadRobotTs } from './robot-ts.js'
+import { permissionHint, withHint } from './platform.js'
 import { get, assertShotFileExists } from './shot-index.js'
 import { checkCanClick, getAuthEpoch } from './auth.js'
 import { screenshotAction } from './actions.js'
@@ -195,7 +196,9 @@ export async function waitChangeAction({
 
   try {
     if (!session.capabilities.canCaptureScreen) {
-      throw new Error('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）')
+      throw new Error(
+        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('screenRecording')),
+      )
     }
     const primary = await session.screen.primaryMonitor()
     const { width, height } = primary.physicalBounds.size
@@ -224,7 +227,13 @@ export async function waitChangeAction({
     for (;;) {
       await assertWaitGrant()
       const tickStartedAt = Date.now()
-      const frame = await session.screen.captureMonitor(primary.id)
+      let frame
+      try {
+        frame = await session.screen.captureMonitor(primary.id)
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('screenRecording')))
+      }
       const current = regionBox === undefined
         ? frame.toBuffer()
         : crop({ width, height, data: frame.toBuffer() }, regionBox).data

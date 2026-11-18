@@ -5,8 +5,9 @@
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { physicalToLogical, relativeToPhysical } from './coords.js'
-import { parseKeySpec, resolveUnicodeChar } from './keys.js'
+import { parseKeySpec, resolveUnicodeChar, chooseKeyChannel } from './keys.js'
 import { loadRobotTs } from './robot-ts.js'
+import { permissionHint, withHint } from './platform.js'
 import { checkCanClick, getAuthEpoch, getStatus } from './auth.js'
 import { logState } from './audit.js'
 import { resolveShotsDir } from './paths.js'
@@ -22,10 +23,18 @@ export async function screenshotAction() {
   const session = await Session.create()
   try {
     if (!session.capabilities.canCaptureScreen) {
-      throw new Error('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）')
+      throw new Error(
+        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('screenRecording')),
+      )
     }
     const primary = await session.screen.primaryMonitor()
-    const img = await session.screen.captureMonitor(primary.id)
+    let img
+    try {
+      img = await session.screen.captureMonitor(primary.id)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('screenRecording')))
+    }
 
     const dir = resolveShotsDir()
     await mkdir(dir, { recursive: true })
@@ -254,11 +263,13 @@ export function describeKeySpec(key) {
  * 发送一次按键或组合键（如 enter / tab / esc / ctrl+c）。
  * 授权闸门与 vp_type 完全相同：persistent 直接放行，unauthorized 直接拦截。
  *
- * 注入通道按键的性质分流（本机实测）：
+ * 注入通道按能力位分流：
  *   - 无修饰键的字符键（字母/数字/符号）→ Unicode 直注。扫描码通道会经过系统输入法，
- *     中文输入法实测会吞掉字母键（按下不落字，下一次 Enter 才吐幽灵字符）、把引号改成中文弯引号。
+ *     Windows 中文输入法实测会吞掉字母键（按下不落字，下一次 Enter 才吐幽灵字符）、
+ *     把引号改成中文弯引号；macOS 未复测，同规则保留（Unicode 直注两端都绕开输入法）。
  *   - 其余（控制键、space、带 ctrl/alt/meta 的组合键）→ 真实扫描码，
  *     这样组合键语义是真的（Ctrl+V 实测能粘上），space 也能激活聚焦的按钮。
+ *   - 后端声明 canTypeUnicode=false 时，字符键退回扫描码而不是直接报错。
  */
 export async function keyAction(args = {}) {
   const grant = captureGrant('vp_key')
@@ -276,11 +287,10 @@ export async function keyAction(args = {}) {
     if (!Object.values(Key).includes(spec.code)) {
       throw new Error(`vp_key: 键码 ${spec.code} 不在 robot-ts 的键表里（上游键表可能已变更）`)
     }
-    if (unicodeChar !== null && !session.capabilities.canTypeUnicode) {
-      throw new Error('当前宿主环境不支持 Unicode 文本注入（canTypeUnicode=false）')
-    }
+    // 后端不支持 Unicode 直注时退回扫描码，而不是让字符键整体报错。
+    const channel = chooseKeyChannel(unicodeChar, session.capabilities)
     await assertGrantStillValid('vp_key', grant)
-    if (unicodeChar !== null) {
+    if (channel === 'unicode') {
       await session.keyboard.typeChar(unicodeChar.codePointAt(0))
     } else {
       await session.keyboard.tap(spec.code, spec.modifiers)
@@ -290,7 +300,7 @@ export async function keyAction(args = {}) {
       key: spec.spec,
       keyName: spec.keyName,
       modifiers: spec.modifiers,
-      method: unicodeChar !== null ? 'unicode' : 'scancode',
+      method: channel,
     }
   } finally {
     await session.dispose()

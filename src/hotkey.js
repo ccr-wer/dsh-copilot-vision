@@ -6,8 +6,11 @@
 // 会话被回收），必须立刻通知宿主把授权强制收回 unauthorized，而不是留着一个按不动的持续授权。
 // 心跳只能看见绑定暴露的状态（isEventTapRunning）；Windows 静默摘钩但消息循环仍在跑的
 // 情况在该 API 下不可观测，见 README「已知限制」。
+// macOS 上未授予辅助功能权限时 CGEventTap 建不起来，start() 直接抛错 —— 走同一条
+// fail-closed 路径，错误消息里附 TCC 授权指引（文案集中在 platform.js）。
 
 import { loadRobotTs } from './robot-ts.js'
+import { permissionHint, withHint } from './platform.js'
 
 export const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 2000
 
@@ -17,6 +20,8 @@ export async function startHotkey({
   healthCheckIntervalMs = DEFAULT_HEALTH_CHECK_INTERVAL_MS,
   // 依赖注入点：生产用真实 robot-ts，回归测试用假 Session 驱动心跳。
   load = loadRobotTs,
+  // 只用于挑授权提示文案；能力判定仍然只看 robot-ts 的 capabilities。
+  platform = process.platform,
 } = {}) {
   let session
   let disposed = false
@@ -55,7 +60,11 @@ export async function startHotkey({
 
     if (!session.eventTap.isSupported) {
       await shutdown()
-      return { available: false, error: '当前环境不支持 EventTap 全局键盘捕获', dispose: async () => {} }
+      return {
+        available: false,
+        error: withHint('当前环境不支持 EventTap 全局键盘捕获', permissionHint('accessibility', platform)),
+        dispose: async () => {},
+      }
     }
 
     let shiftHeld = false
@@ -115,10 +124,11 @@ export async function startHotkey({
   } catch (error) {
     await shutdown()
     const message = error instanceof Error ? error.message : String(error)
-    markUnavailable(`EventTap 启动失败：${message}，已强制撤销全部授权`)
+    const hint = permissionHint('accessibility', platform)
+    markUnavailable(withHint(`EventTap 启动失败：${message}，已强制撤销全部授权`, hint))
     return {
       available: false,
-      error: message,
+      error: withHint(message, hint),
       dispose: async () => {},
     }
   }

@@ -60,9 +60,10 @@ const MODIFIER_ALIASES = {
 // 字符键 → 它在文本里对应的字符。
 //
 // 只给「无修饰键的字符键」准备：这类键改走 Unicode 直注（见 resolveUnicodeChar）。
-// 原因是 robot-ts 的按键注入走 KEYEVENTF_SCANCODE，会经过系统输入法 ——
-// 本机中文输入法实测会把字母键吞成拼音组合串（按下不落字，直到下一次 Enter 才吐出幽灵字符），
-// 还会把引号改写成中文弯引号。Unicode 直注绕开输入法，字符原样落下。
+// 原因是 Windows 上 robot-ts 的按键注入走 KEYEVENTF_SCANCODE，会经过系统输入法 ——
+// 本机中文输入法（WeType）实测会把字母键吞成拼音组合串（按下不落字，直到下一次 Enter
+// 才吐出幽灵字符），还会把引号改写成中文弯引号。Unicode 直注绕开输入法，字符原样落下。
+// macOS 未复测该现象，规则照旧保留：Unicode 直注在两端都不经过输入法。
 //
 // space 不在表里：扫描码空格实测正常，而且只有真实按键才能激活聚焦的按钮。
 const CHARACTER_KEYS = {
@@ -172,4 +173,15 @@ export function resolveUnicodeChar(spec) {
     return base.toUpperCase()
   }
   return null
+}
+
+/**
+ * 字符键最终走哪条注入通道。
+ *
+ * Unicode 直注是首选（绕开输入法），但前提是后端自己声明 canTypeUnicode；
+ * 不支持时退回扫描码 —— 字符可能被输入法吞掉，但不至于因为一个能力位缺失
+ * 就让字符键整个不可用，也不会把宿主差异写成平台分支。
+ */
+export function chooseKeyChannel(unicodeChar, capabilities) {
+  return unicodeChar !== null && capabilities?.canTypeUnicode === true ? 'unicode' : 'scancode'
 }
