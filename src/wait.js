@@ -197,7 +197,7 @@ export async function waitChangeAction({
   try {
     if (!session.capabilities.canCaptureScreen) {
       throw new Error(
-        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('screenRecording')),
+        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('capture')),
       )
     }
     const primary = await session.screen.primaryMonitor()
@@ -232,7 +232,7 @@ export async function waitChangeAction({
         frame = await session.screen.captureMonitor(primary.id)
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
-        throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('screenRecording')))
+        throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('capture')))
       }
       const current = regionBox === undefined
         ? frame.toBuffer()

@@ -24,7 +24,7 @@ export async function screenshotAction() {
   try {
     if (!session.capabilities.canCaptureScreen) {
       throw new Error(
-        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('screenRecording')),
+        withHint('当前宿主环境不支持屏幕捕获（canCaptureScreen=false）', permissionHint('capture')),
       )
     }
     const primary = await session.screen.primaryMonitor()
@@ -33,7 +33,7 @@ export async function screenshotAction() {
       img = await session.screen.captureMonitor(primary.id)
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
-      throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('screenRecording')))
+      throw new Error(withHint(`屏幕捕获失败：${detail}`, permissionHint('capture')))
     }
 
     const dir = resolveShotsDir()
@@ -153,6 +153,11 @@ async function injectClick({ x, y, button = 'left', thought, tool, grant }) {
   try {
     if (!session.capabilities.canInjectMouse) {
       throw new Error('当前宿主环境不支持鼠标注入（canInjectMouse=false）')
+    }
+    if (!session.capabilities.canWarpCursor) {
+      throw new Error(
+        withHint('当前后端不支持绝对光标定位（canWarpCursor=false），无法按坐标落点', permissionHint('absolutePointer')),
+      )
     }
     const primary = await session.screen.primaryMonitor()
     const { width, height } = primary.physicalBounds.size

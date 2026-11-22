@@ -1,12 +1,12 @@
 # Vision-Pilot
 
-为 DSH（DeepSeek Harness）打造的本地桌面 Computer Use 增强插件（Windows 完整验证，macOS 已接入）：让模型不仅能「看」屏幕，还能「等」变化、并「精准」操作。纯 JS 生态实现——无 sharp、无 OpenCV、无重型 native 图像库，唯一的 native 依赖是 robot-ts 随包分发的预编译模块。
+为 DSH（DeepSeek Harness）打造的本地桌面 Computer Use 增强插件（Windows 完整验证，macOS 与 Linux/X11 已接入）：让模型不仅能「看」屏幕，还能「等」变化、并「精准」操作。纯 JS 生态实现——无 sharp、无 OpenCV、无重型 native 图像库，唯一的 native 依赖是 robot-ts 随包分发的预编译模块。
 
 ## 核心设计
 
 ### 纯本地桌面执行
 
-插件只面向本地桌面：经 robot-ts 直连系统 API（屏幕捕获 + 鼠标注入 + 键盘注入 + 低层键盘钩子），不建立任何远程连接，也不注册远程工具。V1.4.0 起正式确立纯本地化路线，此前预留的 SSH / 远程执行接口与依赖已整体移除。平台边界：Windows 为完整验证平台；macOS 的代码路径已接入（依赖 robot-ts 的 darwin 预编译，辅助功能与屏幕录制两项 TCC 授权），但尚未在真机回归；Linux 未支持（Wayland 缺全局截屏后端）。代码里没有按平台分支的功能开关——能不能做，一律由 robot-ts 运行时上报的 `capabilities` 决定。
+插件只面向本地桌面：经 robot-ts 直连系统 API（屏幕捕获 + 鼠标注入 + 键盘注入 + 低层键盘钩子），不建立任何远程连接，也不注册远程工具。V1.4.0 起正式确立纯本地化路线，此前预留的 SSH / 远程执行接口与依赖已整体移除。平台边界：Windows 为完整验证平台；macOS 与 Linux/X11 的代码路径已接入（依赖 robot-ts 各自平台的预编译；macOS 需辅助功能与屏幕录制两项 TCC 授权），但都尚未在真机回归；Linux Wayland 会话只有 uinput 键盘与相对鼠标、没有全局截屏，插件会在捕获与绝对定位处明确报错并引导改用 X11。代码里没有按平台分支的功能开关——能不能做，一律由 robot-ts 运行时上报的 `capabilities` 决定。
 
 ### 动态视觉感知：不传全屏，传差分
 
@@ -84,7 +84,7 @@ robot-ts 有两条注入通道，本插件按键的性质分流：
 
 注意：如果用户正在用输入法打字，组合串还挂在输入法里，此时 `vp_key enter` 会把它一起提交出去。
 
-macOS 未复测：字符键仍走 Unicode 直注（两端都不经过输入法），后端若声明 `canTypeUnicode=false` 则退回扫描码；输入法组合串被 `vp_key enter` 一并提交这一现象在 macOS 上未验证。
+macOS 与 Linux 均未复测：字符键仍走 Unicode 直注（各平台都不经过输入法），后端若声明 `canTypeUnicode=false` 则退回扫描码；输入法组合串被 `vp_key enter` 一并提交这一现象在 macOS、Linux（fcitx/ibus）上都未验证。
 
 ## 长程任务工作流（The OSA V Loop）
 
@@ -107,12 +107,12 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add dsh-copilot-vision
 
 # 或从本地 tarball 安装（开发调试）
 npm pack
-DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.5.0.tgz
+DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot-vision-1.6.0.tgz
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
 - **授权**：按 Shift+Space 开启或撤销持续授权；模型也可调 `vp_request_auth(mode='persistent')` 请求，你在卡片上确认一次。单次授权已取消。
-- **平台**：本地主屏。Windows 完整验证；macOS 已接入但未在真机回归（robot-ts 自带 `darwin-arm64` 预编译；首次使用需在「系统设置 → 隐私与安全性」授予宿主应用的**辅助功能**与**屏幕录制**权限，改完授权必须重启宿主进程）；Linux 未支持（Wayland 缺全局截屏后端）。未授权辅助功能时全局钩子建不起来，插件按 Fail-Closed 收回授权并在错误里给出授权入口。pnpm 11 拦截构建脚本时，在 profile 的 `pnpm-workspace.yaml` 中允许 `robot-ts` 构建；native 缺失时插件仍可加载，调用时返回可读错误。
+- **平台**：本地主屏。Windows 完整验证；macOS 与 Linux/X11 已接入但未在真机回归。macOS 首次使用需在「系统设置 → 隐私与安全性」授予宿主应用的**辅助功能**与**屏幕录制**权限，改完授权必须重启宿主进程；Linux 需 X11 会话（XTest + XRandR + XRecord），Wayland 会话没有截屏、也没有全局钩子，请改用 Xorg 会话；若走 uinput 注入还需 `/dev/uinput` 读写权限（input 组或 udev 规则）。未拿到全局钩子时插件按 Fail-Closed 收回授权并在错误里给出对应授权入口。pnpm 11 拦截构建脚本时，在 profile 的 `pnpm-workspace.yaml` 中允许 `robot-ts` 构建；native 缺失时插件仍可加载，调用时返回可读错误。
 - **落盘**：截图、索引、审计日志默认在 `os.tmpdir()/vision-pilot-shots/`，`VP_SHOT_DIR` 可整体重定向。
 - **迭代**：tarball 是快照，同版本重新 `add` 会被判 "Already up to date"——改源码后标准流程是 `npm pack` → `remove` → `add`。
 
@@ -126,6 +126,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 - **静默摘钩不可观测**：心跳只能读到 robot-ts 暴露的「监听线程是否存活」。Windows 若在消息循环仍在跑的情况下静默卸掉低层钩子，绑定层看不到；此时心跳无法判定失效。插件启动失败与线程退出这两条路径已按 Fail-Closed 处理。
 - **无热键时的残余风险**：EventTap 启动即不可用时，插件不会自动收权（启动状态本就是 `unauthorized`），但人仍可通过 `vp_request_auth` 卡片确认进入 `persistent`——此时没有物理急停通道。是否放行由人在卡片上判断；本轮未禁止该路径。
 - **macOS 未真机验证**：TCC 授权 → EventTap 建立 → 截屏这条链路，以及 Retina 缩放下的坐标换算，都没有在真机跑过。未授权辅助功能时 `start()` 抛错，已按 Fail-Closed 收权并附授权指引；已授权后系统中途收回权限的情形未测。macOS 上若当前没有可用热键，`vp_request_auth` 仍可让人确认进入 `persistent`，此时同样没有物理急停通道。
+- **Linux 未真机验证**：只在 X11 会话下具备完整能力（截屏 / 绝对点击 / XRecord 全局钩子）；Wayland 会话下 `canCaptureScreen` 与 `canWarpCursor` 为假，截图类工具与按坐标点击会在能力闸门处直接报错，不静默降级；若原生后端在创建会话阶段就拒绝（例如没有 X11 显示），错误由 robot-ts 直接抛出，不附本插件的 X11 指引。uinput 后端对 `/dev/uinput` 的权限要求、fcitx/ibus 对扫描码注入的影响、以及 X11 多屏 `scaleFactor` 的表现都未实测。
 - **索引并发**：截图索引整份覆盖写、不做跨进程并发保护，多进程共用 `VP_SHOT_DIR` 会互相覆盖；回归测试一律用独立目录。
 - **临时目录卫生**：超过 3 天的差分/网格切片（`vp-diff-*` / `vp-grid-*`）会在插件启动时被自动清理；模型在收工时调用 `vp_summarize` 会把关键截图归档到 `archives/` 并清空其余全部碎片。基准截图（`vp-shot-*`）、审计日志、索引与 `archives/` 永久保留。
 
@@ -141,7 +142,7 @@ node test-relative.mjs   # 网格渲染 + 相对坐标换算 + 未授权闸门�
 node test-wait.mjs       # 轮询语义（--integration 配合静屏/动屏/假基线）
 node test-keyboard.mjs   # 键名解析 + 注入通道分流 + 持续授权闸门（--live 会真的抢一次键盘焦点）
 node test-summarize.mjs  # 记忆压缩：5 张截图保留 2 张，校验清理、保护区与幂等（不碰屏幕）
-node test-macos.mjs      # 平台提示与能力位分流（可注入 platform，不碰屏幕、不 import native）
+node test-platform.mjs   # 平台提示与能力位分流（可注入 platform，不碰屏幕、不 import native）
 ```
 
 ---

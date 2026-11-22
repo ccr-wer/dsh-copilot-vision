@@ -8,6 +8,8 @@
 // 情况在该 API 下不可观测，见 README「已知限制」。
 // macOS 上未授予辅助功能权限时 CGEventTap 建不起来，start() 直接抛错 —— 走同一条
 // fail-closed 路径，错误消息里附 TCC 授权指引（文案集中在 platform.js）。
+// Linux 上 Wayland 会话没有 XRecord，isSupported 为假或 start() 抛错，同样 fail-closed
+// 并引导改用 X11 会话；X11 下的 uinput 注入还可能被 /dev/uinput 权限挡住。
 
 import { loadRobotTs } from './robot-ts.js'
 import { permissionHint, withHint } from './platform.js'
@@ -62,7 +64,7 @@ export async function startHotkey({
       await shutdown()
       return {
         available: false,
-        error: withHint('当前环境不支持 EventTap 全局键盘捕获', permissionHint('accessibility', platform)),
+        error: withHint('当前环境不支持 EventTap 全局键盘捕获', permissionHint('globalHook', platform)),
         dispose: async () => {},
       }
     }
@@ -124,7 +126,7 @@ export async function startHotkey({
   } catch (error) {
     await shutdown()
     const message = error instanceof Error ? error.message : String(error)
-    const hint = permissionHint('accessibility', platform)
+    const hint = permissionHint('globalHook', platform)
     markUnavailable(withHint(`EventTap 启动失败：${message}，已强制撤销全部授权`, hint))
     return {
       available: false,
