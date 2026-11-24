@@ -10,6 +10,8 @@
 | pixelmatch | 8.0.0 | ISC |
 | pngjs | 7.0.0 | MIT |
 
+> 版本说明：上表按 `package-lock.json` 锁定的版本收录（robot-ts 2.0.3）。部署 profile 由 `dependencies` 的 `^2.0.3` 实际解析到 2.1.1；本插件使用的 API 面（`primaryMonitor` / `captureMonitor` / `typeText` / `typeChar` / `canWarpCursor` / `canTypeUnicode` / `EventTap`）在这两个版本上一致，已逐一核对。robot-ts 的原生模块以 N-API 8 预编译形式随包分发（`prebuilds/<platform>-<arch>/`），安装时不编译。
+
 ### robot-ts (MIT)
 
 ```

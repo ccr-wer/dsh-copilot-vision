@@ -334,6 +334,19 @@ const OFFSET_SCHEMA = {
   },
 }
 
+/**
+ * 容错版工厂：定义阶段（defineTool 校验 schema、宿主换签名）失败时绝不外抛。
+ * 兼容层回归的代价应该是「工具消失 + 宿主日志一行」，而不是把异常交给宿主
+ * 去决定整个插件的生死。返回 { plugin, error }，调用方负责记日志。
+ */
+export function createPluginSafe(defineTool, ctx, hotkeyState) {
+  try {
+    return { plugin: createPlugin(defineTool, ctx, hotkeyState), error: undefined }
+  } catch (error) {
+    return { plugin: { name, inject, tools: [] }, error }
+  }
+}
+
 export function createPlugin(defineTool, ctx, hotkeyState = { available: false, error: '热键尚未初始化' }) {
   const screenshotTool = defineTool({
     name: 'vp_screenshot',

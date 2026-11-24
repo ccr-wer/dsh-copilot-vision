@@ -1,6 +1,6 @@
 {
   "name": "dsh-copilot-vision",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "为 DSH（DeepSeek Harness）打造的本地桌面 Computer Use 增强插件（Windows 完整验证，macOS 与 Linux/X11 已接入）：纯 JS 视觉差分、网格位置编码、键盘注入、语义级记忆压缩、长程任务闭环与人机共驾授权。",
   "main": "./src/index.js",
   "scripts": {
@@ -43,10 +43,10 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2"
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2 || ^0.2.2-rc.5"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2"
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.1 || ^0.2.0-rc.2 || ^0.2.2-rc.5"
   }
 }

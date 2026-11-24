@@ -111,7 +111,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 ```
 
 - **宿主**：web（问答卡片授权）/ headless（无 UI 答者，只能 Shift+Space，需真人在场）/ desktop（待 DSH 市场审核后内置验证）。
-- **授权**：按 Shift+Space 开启或撤销持续授权；模型也可调 `vp_request_auth(mode='persistent')` 请求，你在卡片上确认一次。单次授权已取消。
+- **授权**：按 Shift+Space 开启或撤销持续授权；模型也可调 `vp_request_auth(mode='persistent')` 请求，你在卡片上确认一次。单次授权已取消。热键在插件加载后约 250ms 才生效——启动关键阶段不加载 robot-ts 原生模块（原生段错误是唯一无法被 try/catch 接住的故障面）；这段时间内 `vp_auth_status` 会返回 `hotkeyAvailable:false` 并说明原因。
 - **平台**：本地主屏。Windows 完整验证；macOS 与 Linux/X11 已接入但未在真机回归。macOS 首次使用需在「系统设置 → 隐私与安全性」授予宿主应用的**辅助功能**与**屏幕录制**权限，改完授权必须重启宿主进程；Linux 需 X11 会话（XTest + XRandR + XRecord），Wayland 会话没有截屏、也没有全局钩子，请改用 Xorg 会话；若走 uinput 注入还需 `/dev/uinput` 读写权限（input 组或 udev 规则）。未拿到全局钩子时插件按 Fail-Closed 收回授权并在错误里给出对应授权入口。pnpm 11 拦截构建脚本时，在 profile 的 `pnpm-workspace.yaml` 中允许 `robot-ts` 构建；native 缺失时插件仍可加载，调用时返回可读错误。
 - **落盘**：截图、索引、审计日志默认在 `os.tmpdir()/vision-pilot-shots/`，`VP_SHOT_DIR` 可整体重定向。
 - **迭代**：tarball 是快照，同版本重新 `add` 会被判 "Already up to date"——改源码后标准流程是 `npm pack` → `remove` → `add`。
@@ -119,6 +119,7 @@ DSH_HOME=<DSH_HOME> dsh plugin --profile web add file:<绝对路径>/dsh-copilot
 ## 限制与边界
 
 - **输入能力边界**：支持键盘输入（`vp_type` 文本 / `vp_key` 按键与组合键）；不支持拖拽、滚轮、双击。键盘只作用于**当前焦点控件**，模型无法自己「在地址栏输入」前必须先用鼠标点中输入框。
+- **失败只降级、不外抛**：工具定义或注册阶段失败（dsh-tools 换了签名、工具重名、schema 被宿主驳回）只记录一行日志并跳过，其余工具照常注册；热键初始化全程 try/catch，失败时 `hotkeyAvailable:false` 并按 Fail-Closed 收回授权。插件不会把异常抛给宿主，也不会在宿主启动路径上加载原生模块。
 - **输入法干扰**：中文输入法会吞掉扫描码注入的字母键（按下不落字，要到下一次 Enter 才吐幽灵字符）。插件已对无修饰键的字符键改走 Unicode 直注绕开它，但用户在输入法里挂着的组合串仍会被 `vp_key enter` 一起提交。
 - **聊天窗口自干扰**：宿主聊天窗口的流式重绘会被当成屏幕变化（实测覆盖率约为变化门限的 14 倍）。等页面加载时，优先给 `vp_wait_change` / `vp_screenshot_diff` 传 `region` 只盯目标区域，或先把聊天窗口移出主屏、最小化。
 - **鼠标移动不可检测**：Windows 屏幕捕获不含硬件光标，挪鼠标不产生任何像素变化。
